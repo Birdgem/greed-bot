@@ -54,6 +54,8 @@ DAILY_PNL = 0.0
 WEEKLY_PNL = 0.0
 DEALS = 0
 
+PAIR_STATS = {}  # pair -> {"pnl": float, "deals": int}
+
 LAST_DAY = datetime.utcnow().date()
 LAST_WEEK = datetime.utcnow().isocalendar().week
 
@@ -252,6 +254,11 @@ async def grid_engine():
                     DAILY_PNL += pnl
                     WEEKLY_PNL += pnl
                     DEALS += 1
+
+                    PAIR_STATS.setdefault(pair, {"pnl": 0.0, "deals": 0})
+                    PAIR_STATS[pair]["pnl"] += pnl
+                    PAIR_STATS[pair]["deals"] += 1
+
                     o["open"] = False
 
         if len(ACTIVE_GRIDS) < MAX_GRIDS:
@@ -309,6 +316,36 @@ async def start(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
     await msg.answer("🤖 GRID BOT RUNNING\n" + BTC_CONTEXT)
+
+@dp.message(Command("stats"))
+async def stats(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    lines = [
+        "📊 STATISTICS\n",
+        BTC_CONTEXT,
+        f"Mode: {BOT_MODE}\n",
+        "Pairs:"
+    ]
+
+    if PAIR_STATS:
+        for p, s in PAIR_STATS.items():
+            lines.append(f"• {p} — {s['pnl']:.2f}$ ({s['deals']} deals)")
+    else:
+        lines.append("• нет данных")
+
+    uptime = int((time.time() - START_TS) / 60)
+
+    lines.append("\nTotal:")
+    lines.append(f"• Deals: {DEALS}")
+    lines.append(f"• Total PnL: {TOTAL_PNL:.2f}$")
+    lines.append(f"• Daily: {DAILY_PNL:.2f}$")
+    lines.append(f"• Weekly: {WEEKLY_PNL:.2f}$")
+    lines.append(f"\nUptime: {uptime} min")
+    lines.append(f"(DRY {DEPOSIT}$ x{LEVERAGE})")
+
+    await msg.answer("\n".join(lines))
 
 # ================== MAIN ==================
 async def main():
