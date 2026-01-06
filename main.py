@@ -43,21 +43,19 @@ WEEKLY_STOP_LOSS_PCT = -0.08
 WEEKLY_TAKE_PROFIT_PCT = 0.12
 
 # ---- FUNDING ----
-FUNDING_WARN_PCT = 0.03  # 0.03%
+FUNDING_WARN_PCT = 0.03
 
 # ================== STATE ==================
 START_TS = time.time()
-
 BOT_MODE = "ACTIVE"
 
 ACTIVE_GRIDS = {}
+PAIR_STATS = {}
 
 TOTAL_PNL = 0.0
 DAILY_PNL = 0.0
 WEEKLY_PNL = 0.0
 DEALS = 0
-
-PAIR_STATS = {}
 
 LAST_DAY = datetime.utcnow().date()
 LAST_WEEK = datetime.utcnow().isocalendar().week
@@ -118,7 +116,6 @@ async def get_funding(symbol):
 # ================== BTC CONTEXT ==================
 async def update_btc_context():
     global BTC_CONTEXT
-
     kl = await get_klines("BTCUSDT", limit=100)
     if len(kl) < 50:
         return
@@ -161,17 +158,13 @@ async def analyze_pair(pair):
     else:
         return None
 
-    return {
-        "price": price,
-        "side": side,
-        "atr": atr_val
-    }
+    return {"price": price, "side": side, "atr": atr_val}
 
 # ================== GRID ==================
 def build_grid(price, atr_val):
     levels = grid_levels_by_atr(price, atr_val)
-
     rng = atr_val * ATR_MULT
+
     low = price - rng
     high = price + rng
 
@@ -184,43 +177,14 @@ def build_grid(price, atr_val):
     for i in range(levels):
         buy = low + step * i
         sell = buy + step
-        orders.append({
-            "buy": buy,
-            "sell": sell,
-            "qty": qty,
-            "open": False
-        })
+        orders.append({"buy": buy, "sell": sell, "qty": qty, "open": False})
 
     return low, high, orders, levels
 
-def calc_pnl(buy, sell, qty):
-    gross = (sell - buy) * qty
-    fee = (buy * qty * MAKER_FEE) + (sell * qty * TAKER_FEE)
+def calc_pnl(entry, exit, qty):
+    gross = (exit - entry) * qty
+    fee = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
     return gross - fee
-
-# ================== RISK CHECK ==================
-async def risk_check():
-    global BOT_MODE
-
-    daily_roi = DAILY_PNL / DEPOSIT
-    weekly_roi = WEEKLY_PNL / DEPOSIT
-
-    if BOT_MODE == "ACTIVE":
-        if daily_roi <= DAILY_STOP_LOSS_PCT or daily_roi >= DAILY_TAKE_PROFIT_PCT:
-            BOT_MODE = "PAUSE_DAY"
-            ACTIVE_GRIDS.clear()
-            await bot.send_message(
-                ADMIN_ID,
-                f"⏸ DAILY LIMIT HIT\nDaily PnL: {DAILY_PNL:.2f}$\n{BTC_CONTEXT}"
-            )
-
-        elif weekly_roi <= WEEKLY_STOP_LOSS_PCT or weekly_roi >= WEEKLY_TAKE_PROFIT_PCT:
-            BOT_MODE = "PAUSE_WEEK"
-            ACTIVE_GRIDS.clear()
-            await bot.send_message(
-                ADMIN_ID,
-                f"⏸ WEEKLY LIMIT HIT\nWeekly PnL: {WEEKLY_PNL:.2f}$\n{BTC_CONTEXT}"
-            )
 
 # ================== ENGINE ==================
 async def grid_engine():
@@ -238,40 +202,41 @@ async def grid_engine():
         if now.date() != LAST_DAY:
             DAILY_PNL = 0.0
             LAST_DAY = now.date()
-            if BOT_MODE == "PAUSE_DAY":
-                BOT_MODE = "ACTIVE"
+            BOT_MODE = "ACTIVE"
 
-        week = now.isocalendar().week
-        if week != LAST_WEEK:
+        if now.isocalendar().week != LAST_WEEK:
             WEEKLY_PNL = 0.0
-            LAST_WEEK = week
-            if BOT_MODE == "PAUSE_WEEK":
-                BOT_MODE = "ACTIVE"
+            LAST_WEEK = now.isocalendar().week
+            BOT_MODE = "ACTIVE"
 
-        await risk_check()
-
-        if BOT_MODE != "ACTIVE":
-            await asyncio.sleep(SCAN_INTERVAL)
-            continue
-
-        # --- update active grids ---
+        # ---- UPDATE GRIDS ----
         for pair, g in list(ACTIVE_GRIDS.items()):
             kl = await get_klines(pair, limit=2)
             price = float(kl[-1][4])
 
             if price < g["low"] or price > g["high"]:
                 del ACTIVE_GRIDS[pair]
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"🛑 GRID STOP (ATR)\n{pair}\n{BTC_CONTEXT}"
-                )
+                await bot.send_message(ADMIN_ID, f"🛑 GRID STOP (ATR)\n{pair}")
                 continue
 
             for o in g["orders"]:
-                if not o["open"] and price <= o["buy"]:
-                    o["open"] = True
-                elif o["open"] and price >= o["sell"]:
-                    pnl = calc_pnl(o["buy"], o["sell"], o["qty"])
+                pnl = None
+
+                if g["side"] == "LONG":
+                    if not o["open"] and price <= o["buy"]:
+                        o["open"] = True
+                    elif o["open"] and price >= o["sell"]:
+                        pnl = calc_pnl(o["buy"], o["sell"], o["qty"])
+                        o["open"] = False
+
+                elif g["side"] == "SHORT":
+                    if not o["open"] and price >= o["sell"]:
+                        o["open"] = True
+                    elif o["open"] and price <= o["buy"]:
+                        pnl = calc_pnl(o["sell"], o["buy"], o["qty"])
+                        o["open"] = False
+
+                if pnl is not None:
                     TOTAL_PNL += pnl
                     DAILY_PNL += pnl
                     WEEKLY_PNL += pnl
@@ -281,9 +246,7 @@ async def grid_engine():
                     PAIR_STATS[pair]["pnl"] += pnl
                     PAIR_STATS[pair]["deals"] += 1
 
-                    o["open"] = False
-
-        # --- start new grids ---
+        # ---- START NEW GRIDS ----
         if len(ACTIVE_GRIDS) < MAX_GRIDS:
             for pair in PAIRS:
                 if pair in ACTIVE_GRIDS:
@@ -302,20 +265,9 @@ async def grid_engine():
                 }
 
                 funding = FUNDING_CACHE.get(pair, 0.0)
-                warn = ""
-                if res["side"] == "LONG" and funding > FUNDING_WARN_PCT:
-                    warn = " ⚠️"
-                elif res["side"] == "SHORT" and funding < -FUNDING_WARN_PCT:
-                    warn = " ⚠️"
-
                 await bot.send_message(
                     ADMIN_ID,
-                    f"🧱 GRID START\n"
-                    f"{pair}\n"
-                    f"Side: {res['side']}\n"
-                    f"Levels: {levels}\n"
-                    f"Funding: {funding:+.3f}%{warn}\n"
-                    f"{BTC_CONTEXT}"
+                    f"🧱 GRID START\n{pair}\nSide: {res['side']}\nLevels: {levels}\nFunding: {funding:+.3f}%\n{BTC_CONTEXT}"
                 )
 
                 if len(ACTIVE_GRIDS) >= MAX_GRIDS:
@@ -327,67 +279,46 @@ async def grid_engine():
 async def heartbeat():
     while True:
         uptime = int((time.time() - START_TS) / 60)
-
-        lines = [
-            "✅ GRID BOT ONLINE",
-            "",
-            BTC_CONTEXT,
-            f"Mode: {BOT_MODE}",
-            f"Grids: {', '.join(ACTIVE_GRIDS) if ACTIVE_GRIDS else 'нет'}",
-            f"Deals: {DEALS}",
-            f"Total: {TOTAL_PNL:.2f}$",
-            f"Daily: {DAILY_PNL:.2f}$",
-            f"Weekly: {WEEKLY_PNL:.2f}$",
-            "",
-            "Funding:"
-        ]
-
-        for p, f in FUNDING_CACHE.items():
-            lines.append(f"• {p}: {f:+.3f}%")
-
-        lines.append(f"\nUptime: {uptime} min")
-        lines.append(f"(DRY {DEPOSIT}$ x{LEVERAGE})")
-
-        await bot.send_message(ADMIN_ID, "\n".join(lines))
+        await bot.send_message(
+            ADMIN_ID,
+            f"✅ GRID BOT ONLINE\n"
+            f"{BTC_CONTEXT}\n"
+            f"Mode: {BOT_MODE}\n"
+            f"Grids: {', '.join(ACTIVE_GRIDS) if ACTIVE_GRIDS else 'нет'}\n"
+            f"Deals: {DEALS}\n"
+            f"Total: {TOTAL_PNL:.2f}$\n"
+            f"Daily: {DAILY_PNL:.2f}$\n"
+            f"Weekly: {WEEKLY_PNL:.2f}$\n"
+            f"Uptime: {uptime} min\n"
+            f"(DRY {DEPOSIT}$ x{LEVERAGE})"
+        )
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 # ================== COMMANDS ==================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    await msg.answer("🤖 GRID BOT RUNNING\n" + BTC_CONTEXT)
+    if msg.from_user.id == ADMIN_ID:
+        await msg.answer("🤖 GRID BOT RUNNING\n" + BTC_CONTEXT)
 
 @dp.message(Command("stats"))
 async def stats(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
 
-    lines = [
-        "📊 STATISTICS",
-        "",
-        BTC_CONTEXT,
-        f"Mode: {BOT_MODE}",
-        "",
-        "Pairs:"
-    ]
-
+    lines = ["📊 STATISTICS", BTC_CONTEXT, "", "Pairs:"]
     if PAIR_STATS:
         for p, s in PAIR_STATS.items():
-            lines.append(f"• {p} — {s['pnl']:.2f}$ ({s['deals']} deals)")
+            lines.append(f"• {p}: {s['pnl']:.2f}$ ({s['deals']} deals)")
     else:
         lines.append("• нет данных")
 
     uptime = int((time.time() - START_TS) / 60)
-
     lines += [
         "",
-        "Total:",
-        f"• Deals: {DEALS}",
-        f"• Total PnL: {TOTAL_PNL:.2f}$",
-        f"• Daily: {DAILY_PNL:.2f}$",
-        f"• Weekly: {WEEKLY_PNL:.2f}$",
-        f"",
+        f"Deals: {DEALS}",
+        f"Total: {TOTAL_PNL:.2f}$",
+        f"Daily: {DAILY_PNL:.2f}$",
+        f"Weekly: {WEEKLY_PNL:.2f}$",
         f"Uptime: {uptime} min",
         f"(DRY {DEPOSIT}$ x{LEVERAGE})"
     ]
