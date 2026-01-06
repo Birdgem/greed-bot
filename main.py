@@ -2,57 +2,53 @@ import os
 import asyncio
 import aiohttp
 import time
-from statistics import mean
-from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ================= CONFIG =================
+# ================== CONFIG ==================
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
+SYMBOL = "SOLUSDT"
+TIMEFRAME = "5m"
+
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
+# --- DRY RUN ---
+DEPOSIT = 100.0
+LEVERAGE = 10
+
+MAKER_FEE = 0.0002
+TAKER_FEE = 0.0004
+
+MAX_MARGIN_PER_GRID = 0.10     # 10% депо
+GRID_LEVELS = 10
+GRID_SPREAD = 0.015            # 1.5%
+
+DAILY_PROFIT_CAP = 0.05        # +5%
+DAILY_LOSS_CAP = -0.03         # -3%
+
+SCAN_INTERVAL = 30
+HEARTBEAT_INTERVAL = 1800      # 30 минут
+
+# ================== STATE ==================
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
-
-PAIRS = [
-    "HUSDT", "SOLUSDT", "ETHUSDT", "RIVERUSDT", "LIGHTUSDT",
-    "BEATUSDT", "CYSUSDT", "ZPKUSDT", "RAVEUSDT", "DOGEUSDT"
-]
-
-TIMEFRAMES = ["5m", "15m"]
-CURRENT_TF = "5m"
-
-ENABLED_PAIRS = {p: False for p in PAIRS}
-
-SCAN_INTERVAL = 30
 START_TS = time.time()
 
-# ===== DRY RUN PARAMS =====
-DRY_DEPOSIT = 100.0
-DRY_LEVERAGE = 10
+MODE = "ACTIVE"   # ACTIVE / PAUSE
+GRID_ACTIVE = False
+GRID_SIDE = None  # LONG / SHORT
 
-MAX_GRIDS = 2
-MAX_DRAWDOWN_PCT = -15
-DAILY_LOSS_LIMIT_PCT = -5
-MAX_IDLE_MIN = 20
-FLAT_KILL_DEALS = 8
+ENTRY_PRICE = None
+GRID_ORDERS = []
 
-BOT_MODE = "ACTIVE"  # ACTIVE / PAUSE / STOP
+TOTAL_PNL = 0.0
+DAILY_PNL = 0.0
+TOTAL_DEALS = 0
 
-ACTIVE_GRIDS = {}
-
-STATS = {
-    "total_pnl": 0.0,
-    "daily_pnl": 0.0,
-    "deals": 0,
-    "day": datetime.utcnow().date()
-}
-
-# ================= UTILS =================
+# ================== UTILS ==================
 def ema(data, period):
     if len(data) < period:
         return None
@@ -62,233 +58,179 @@ def ema(data, period):
         e = p * k + e * (1 - k)
     return e
 
-def atr(highs, lows, closes, period=14):
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i] - closes[i-1])
-        )
-        trs.append(tr)
-    return mean(trs[-period:]) if len(trs) >= period else None
+def calc_pnl(entry, exit, qty):
+    notional = qty * exit
+    margin = notional / LEVERAGE
 
-# ================= BINANCE =================
-async def get_klines(symbol, interval, limit=120):
+    raw = (exit - entry) * qty if GRID_SIDE == "LONG" else (entry - exit) * qty
+    fees = notional * (MAKER_FEE * 2)
+
+    pnl = raw - fees
+    roi = pnl / margin if margin > 0 else 0
+    return pnl, roi
+
+# ================== BINANCE ==================
+async def get_klines(limit=120):
     async with aiohttp.ClientSession() as s:
         async with s.get(
-            BINANCE_URL,
-            params={"symbol": symbol, "interval": interval, "limit": limit}
+            BINANCE_KLINES,
+            params={
+                "symbol": SYMBOL,
+                "interval": TIMEFRAME,
+                "limit": limit
+            }
         ) as r:
-            data = await r.json()
-            return data if isinstance(data, list) else []
+            return await r.json()
 
-async def get_price(symbol):
-    async with aiohttp.ClientSession() as s:
-        async with s.get(PRICE_URL, params={"symbol": symbol}) as r:
-            data = await r.json()
-            return float(data["price"])
+# ================== ANALYSIS ==================
+async def detect_direction():
+    kl = await get_klines()
+    closes = [float(k[4]) for k in kl]
 
-# ================= GRID LOGIC =================
-async def analyze_for_grid(pair):
-    kl = await get_klines(pair, CURRENT_TF)
-    if len(kl) < 50:
-        return None
-
-    closes, highs, lows = [], [], []
-    for k in kl:
-        closes.append(float(k[4]))
-        highs.append(float(k[2]))
-        lows.append(float(k[3]))
-
-    price = closes[-1]
+    ema7 = ema(closes, 7)
     ema25 = ema(closes, 25)
-    ema99 = ema(closes, 99)
-    atr_val = atr(highs, lows, closes)
 
-    if not all([ema25, ema99, atr_val]):
+    if not ema7 or not ema25:
         return None
 
-    atr_pct = atr_val / price * 100
-    if atr_pct > 0.8:
-        return None  # не флет
+    if ema7 > ema25:
+        return "LONG"
+    if ema7 < ema25:
+        return "SHORT"
+    return None
 
-    direction = None
-    if price > ema25 > ema99:
-        direction = "LONG"
-    elif price < ema25 < ema99:
-        direction = "SHORT"
+# ================== GRID ==================
+def build_grid(price, side):
+    orders = []
 
-    if not direction:
-        return None
+    margin = DEPOSIT * MAX_MARGIN_PER_GRID
+    notional = margin * LEVERAGE
+    qty = notional / price / GRID_LEVELS
 
-    low = price * (1 - atr_pct * 2 / 100)
-    high = price * (1 + atr_pct * 2 / 100)
+    for i in range(1, GRID_LEVELS + 1):
+        step = GRID_SPREAD * i
 
-    levels = 8
-    step = (high - low) / levels
-    size = (DRY_DEPOSIT / levels) * DRY_LEVERAGE
+        if side == "LONG":
+            buy = price * (1 - step)
+            sell = price * (1 + step)
+        else:
+            buy = price * (1 + step)
+            sell = price * (1 - step)
 
-    orders = [{"price": low + step * i, "filled": False} for i in range(levels)]
+        orders.append({
+            "buy": buy,
+            "sell": sell,
+            "qty": qty,
+            "filled": False
+        })
 
-    return {
-        "pair": pair,
-        "dir": direction,
-        "low": low,
-        "high": high,
-        "orders": orders,
-        "size": size,
-        "last_trade": time.time(),
-        "deals": 0,
-        "pnl": 0.0
-    }
+    return orders
 
-# ================= ENGINE =================
-async def process_grids():
-    global BOT_MODE
+# ================== ENGINE ==================
+async def grid_engine():
+    global GRID_ACTIVE, GRID_SIDE, ENTRY_PRICE
+    global TOTAL_PNL, DAILY_PNL, TOTAL_DEALS, MODE, GRID_ORDERS
 
     while True:
-        today = datetime.utcnow().date()
-        if today != STATS["day"]:
-            STATS["day"] = today
-            STATS["daily_pnl"] = 0
-
-        # ----- GLOBAL RISK -----
-        drawdown = STATS["total_pnl"] / DRY_DEPOSIT * 100
-        daily_dd = STATS["daily_pnl"] / DRY_DEPOSIT * 100
-
-        if drawdown <= MAX_DRAWDOWN_PCT:
-            BOT_MODE = "STOP"
-            ACTIVE_GRIDS.clear()
-            await bot.send_message(ADMIN_ID, "🛑 MAX DRAWDOWN. BOT STOPPED")
-
-        if daily_dd <= DAILY_LOSS_LIMIT_PCT:
-            BOT_MODE = "PAUSE"
-            ACTIVE_GRIDS.clear()
-            await bot.send_message(ADMIN_ID, "⏸ DAILY LOSS LIMIT. PAUSE")
-
-        if BOT_MODE != "ACTIVE":
-            await asyncio.sleep(10)
+        if MODE != "ACTIVE":
+            await asyncio.sleep(SCAN_INTERVAL)
             continue
 
-        for p, g in list(ACTIVE_GRIDS.items()):
-            price = await get_price(p)
+        kl = await get_klines(limit=2)
+        price = float(kl[-1][4])
 
-            if (time.time() - g["last_trade"]) / 60 > MAX_IDLE_MIN:
-                del ACTIVE_GRIDS[p]
+        if not GRID_ACTIVE:
+            side = await detect_direction()
+            if not side:
+                await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            for o in g["orders"]:
-                if not o["filled"]:
-                    if g["dir"] == "LONG" and price <= o["price"]:
-                        o["filled"] = True
-                        g["last_trade"] = time.time()
-                    elif g["dir"] == "SHORT" and price >= o["price"]:
-                        o["filled"] = True
-                        g["last_trade"] = time.time()
-                else:
-                    if g["dir"] == "LONG" and price >= o["price"] * 1.002:
-                        pnl = (price - o["price"]) * g["size"]
-                    elif g["dir"] == "SHORT" and price <= o["price"] * 0.998:
-                        pnl = (o["price"] - price) * g["size"]
-                    else:
-                        continue
+            GRID_SIDE = side
+            ENTRY_PRICE = price
+            GRID_ORDERS = build_grid(price, side)
+            GRID_ACTIVE = True
 
-                    g["pnl"] += pnl
-                    g["deals"] += 1
-                    STATS["total_pnl"] += pnl
-                    STATS["daily_pnl"] += pnl
-                    STATS["deals"] += 1
-                    o["filled"] = False
-                    g["last_trade"] = time.time()
-
-            if g["deals"] >= FLAT_KILL_DEALS and g["pnl"] <= 0:
-                del ACTIVE_GRIDS[p]
-                await bot.send_message(ADMIN_ID, f"⚠️ GRID CLOSED (FLAT)\n{p}")
-
-        await asyncio.sleep(5)
-
-# ================= SCANNER =================
-async def scanner():
-    while True:
-        if BOT_MODE != "ACTIVE":
-            await asyncio.sleep(30)
-            continue
-
-        if len(ACTIVE_GRIDS) >= MAX_GRIDS:
-            await asyncio.sleep(30)
-            continue
-
-        for p, on in ENABLED_PAIRS.items():
-            if not on or p in ACTIVE_GRIDS:
-                continue
-
-            grid = await analyze_for_grid(p)
-            if not grid:
-                continue
-
-            ACTIVE_GRIDS[p] = grid
             await bot.send_message(
                 ADMIN_ID,
-                f"🧱 GRID START\n{p} ({CURRENT_TF})\nТип: {grid['dir']}"
+                f"🧠 GRID STARTED\n"
+                f"Symbol: {SYMBOL}\n"
+                f"Side: {side}\n"
+                f"Entry: {price:.4f}\n"
+                f"(DRY {DEPOSIT}$ x{LEVERAGE})"
+            )
+
+        for o in GRID_ORDERS:
+            if o["filled"]:
+                continue
+
+            if GRID_SIDE == "LONG" and price <= o["buy"]:
+                o["filled"] = True
+
+            elif GRID_SIDE == "SHORT" and price >= o["buy"]:
+                o["filled"] = True
+
+            elif o["filled"]:
+                pnl, roi = calc_pnl(ENTRY_PRICE, price, o["qty"])
+                TOTAL_PNL += pnl
+                DAILY_PNL += pnl
+                TOTAL_DEALS += 1
+
+        daily_roi = DAILY_PNL / DEPOSIT
+        if daily_roi >= DAILY_PROFIT_CAP or daily_roi <= DAILY_LOSS_CAP:
+            MODE = "PAUSE"
+            GRID_ACTIVE = False
+            await bot.send_message(
+                ADMIN_ID,
+                "🧯 GRID PAUSED\n"
+                f"Daily PnL: {DAILY_PNL:.2f}$"
             )
 
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ================= UI =================
-def main_keyboard():
-    rows = []
-    for p, on in ENABLED_PAIRS.items():
-        rows.append([
-            InlineKeyboardButton(
-                text=("🟢 " if on else "🔴 ") + p.replace("USDT", ""),
-                callback_data=f"pair:{p}"
-            )
-        ])
-    rows.append([
-        InlineKeyboardButton(text=f"⏱ {CURRENT_TF}", callback_data="tf"),
-        InlineKeyboardButton(text="📊 Статус", callback_data="status")
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+# ================== HEARTBEAT ==================
+async def heartbeat():
+    while True:
+        uptime = int((time.time() - START_TS) / 60)
 
-@dp.message(Command("start"))
-async def start(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    await msg.answer("🧱 GRID BOT v5 (SAFE)", reply_markup=main_keyboard())
-
-@dp.callback_query()
-async def callbacks(c: types.CallbackQuery):
-    global CURRENT_TF
-    if c.from_user.id != ADMIN_ID:
-        return
-
-    if c.data.startswith("pair:"):
-        p = c.data.split(":")[1]
-        ENABLED_PAIRS[p] = not ENABLED_PAIRS[p]
-
-    elif c.data == "tf":
-        i = TIMEFRAMES.index(CURRENT_TF)
-        CURRENT_TF = TIMEFRAMES[(i + 1) % len(TIMEFRAMES)]
-
-    elif c.data == "status":
-        await c.message.answer(
-            f"📊 STATUS\n\n"
-            f"🧠 Mode: {BOT_MODE}\n"
-            f"🧱 Grids: {', '.join(ACTIVE_GRIDS.keys()) or 'нет'}\n"
-            f"📦 Deals: {STATS['deals']}\n"
-            f"💰 Total PnL: {STATS['total_pnl']:.2f}$\n"
-            f"📉 Daily: {STATS['daily_pnl']:.2f}$\n"
-            f"(DRY {DRY_DEPOSIT}$ x{DRY_LEVERAGE})"
+        text = (
+            "✅ GRID BOT ONLINE\n\n"
+            f"Mode: {MODE}\n"
+            f"Symbol: {SYMBOL}\n"
+            f"TF: {TIMEFRAME}\n"
+            f"Grid: {'ON' if GRID_ACTIVE else 'OFF'}\n"
+            f"Deals: {TOTAL_DEALS}\n"
+            f"Total PnL: {TOTAL_PNL:.2f}$\n"
+            f"Daily PnL: {DAILY_PNL:.2f}$\n"
+            f"Uptime: {uptime} min\n"
+            f"(DRY {DEPOSIT}$ x{LEVERAGE})"
         )
 
-    await c.message.edit_reply_markup(reply_markup=main_keyboard())
-    await c.answer()
+        try:
+            await bot.send_message(ADMIN_ID, text)
+        except Exception:
+            pass
 
-# ================= MAIN =================
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+# ================== COMMANDS ==================
+@dp.message(Command("status"))
+async def status(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    await msg.answer(
+        f"📊 STATUS\n"
+        f"Mode: {MODE}\n"
+        f"Grid: {'ON' if GRID_ACTIVE else 'OFF'}\n"
+        f"Deals: {TOTAL_DEALS}\n"
+        f"Total PnL: {TOTAL_PNL:.2f}$\n"
+        f"Daily PnL: {DAILY_PNL:.2f}$"
+    )
+
+# ================== MAIN ==================
 async def main():
-    asyncio.create_task(scanner())
-    asyncio.create_task(process_grids())
+    asyncio.create_task(grid_engine())
+    asyncio.create_task(heartbeat())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
