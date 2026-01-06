@@ -2,53 +2,64 @@ import os
 import asyncio
 import aiohttp
 import time
+from statistics import mean
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
-# ================== CONFIG ==================
+# ================== ENV ==================
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-SYMBOL = "SOLUSDT"
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# ================== SETTINGS ==================
+PAIRS = ["SOLUSDT", "ETHUSDT", "BTCUSDT"]
 TIMEFRAME = "5m"
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
-# --- DRY RUN ---
+# ---- DRY RUN ----
 DEPOSIT = 100.0
 LEVERAGE = 10
+MAX_GRIDS = 2
+MAX_MARGIN_PER_GRID = 0.10
 
 MAKER_FEE = 0.0002
 TAKER_FEE = 0.0004
 
-MAX_MARGIN_PER_GRID = 0.10     # 10% депо
-GRID_LEVELS = 10
-GRID_SPREAD = 0.015            # 1.5%
+ATR_PERIOD = 14
+ATR_MULT = 2.5
+GRID_LEVELS = 8
 
-DAILY_PROFIT_CAP = 0.05        # +5%
-DAILY_LOSS_CAP = -0.03         # -3%
+SCAN_INTERVAL = 20
+HEARTBEAT_INTERVAL = 1800
 
-SCAN_INTERVAL = 30
-HEARTBEAT_INTERVAL = 1800      # 30 минут
+# ---- RISK MANAGEMENT ----
+DAILY_STOP_LOSS_PCT = -0.03
+DAILY_TAKE_PROFIT_PCT = 0.05
+WEEKLY_STOP_LOSS_PCT = -0.08
+WEEKLY_TAKE_PROFIT_PCT = 0.12
 
 # ================== STATE ==================
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-
 START_TS = time.time()
 
-MODE = "ACTIVE"   # ACTIVE / PAUSE
-GRID_ACTIVE = False
-GRID_SIDE = None  # LONG / SHORT
+BOT_MODE = "ACTIVE"  # ACTIVE / PAUSE_DAY / PAUSE_WEEK
 
-ENTRY_PRICE = None
-GRID_ORDERS = []
+ACTIVE_GRIDS = {}
 
 TOTAL_PNL = 0.0
 DAILY_PNL = 0.0
-TOTAL_DEALS = 0
+WEEKLY_PNL = 0.0
+DEALS = 0
 
-# ================== UTILS ==================
+LAST_DAY = datetime.utcnow().date()
+LAST_WEEK = datetime.utcnow().isocalendar().week
+
+BTC_CONTEXT = "⚪ BTC FLAT"
+
+# ================== INDICATORS ==================
 def ema(data, period):
     if len(data) < period:
         return None
@@ -58,132 +69,218 @@ def ema(data, period):
         e = p * k + e * (1 - k)
     return e
 
-def calc_pnl(entry, exit, qty):
-    notional = qty * exit
-    margin = notional / LEVERAGE
-
-    raw = (exit - entry) * qty if GRID_SIDE == "LONG" else (entry - exit) * qty
-    fees = notional * (MAKER_FEE * 2)
-
-    pnl = raw - fees
-    roi = pnl / margin if margin > 0 else 0
-    return pnl, roi
+def atr(highs, lows, closes):
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
+        trs.append(tr)
+    return mean(trs[-ATR_PERIOD:]) if len(trs) >= ATR_PERIOD else None
 
 # ================== BINANCE ==================
-async def get_klines(limit=120):
+async def get_klines(symbol, limit=120):
     async with aiohttp.ClientSession() as s:
         async with s.get(
-            BINANCE_KLINES,
+            BINANCE_URL,
             params={
-                "symbol": SYMBOL,
+                "symbol": symbol,
                 "interval": TIMEFRAME,
                 "limit": limit
             }
         ) as r:
-            return await r.json()
+            data = await r.json()
+            return data if isinstance(data, list) else []
 
-# ================== ANALYSIS ==================
-async def detect_direction():
-    kl = await get_klines()
+# ================== BTC CONTEXT ==================
+async def update_btc_context():
+    global BTC_CONTEXT
+
+    kl = await get_klines("BTCUSDT", limit=100)
+    if len(kl) < 50:
+        return
+
     closes = [float(k[4]) for k in kl]
+    price = closes[-1]
 
     ema7 = ema(closes, 7)
     ema25 = ema(closes, 25)
 
     if not ema7 or not ema25:
+        return
+
+    if price > ema7 > ema25:
+        BTC_CONTEXT = "🟢 BTC BULL"
+    elif price < ema7 < ema25:
+        BTC_CONTEXT = "🔴 BTC BEAR"
+    else:
+        BTC_CONTEXT = "⚪ BTC FLAT"
+
+# ================== ANALYSIS ==================
+async def analyze_pair(pair):
+    kl = await get_klines(pair)
+    if len(kl) < 50:
         return None
 
-    if ema7 > ema25:
-        return "LONG"
-    if ema7 < ema25:
-        return "SHORT"
-    return None
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+
+    price = closes[-1]
+    ema7 = ema(closes, 7)
+    ema25 = ema(closes, 25)
+    atr_val = atr(highs, lows, closes)
+
+    if not ema7 or not ema25 or not atr_val:
+        return None
+
+    if price > ema7 > ema25:
+        side = "LONG"
+    elif price < ema7 < ema25:
+        side = "SHORT"
+    else:
+        return None
+
+    return {
+        "price": price,
+        "side": side,
+        "atr": atr_val
+    }
 
 # ================== GRID ==================
-def build_grid(price, side):
-    orders = []
+def build_grid(price, atr_val):
+    rng = atr_val * ATR_MULT
+    low = price - rng
+    high = price + rng
 
+    step = (high - low) / GRID_LEVELS
     margin = DEPOSIT * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
-    qty = notional / price / GRID_LEVELS
+    qty = (notional / price) / GRID_LEVELS
 
-    for i in range(1, GRID_LEVELS + 1):
-        step = GRID_SPREAD * i
-
-        if side == "LONG":
-            buy = price * (1 - step)
-            sell = price * (1 + step)
-        else:
-            buy = price * (1 + step)
-            sell = price * (1 - step)
-
+    orders = []
+    for i in range(GRID_LEVELS):
+        buy = low + step * i
+        sell = buy + step
         orders.append({
             "buy": buy,
             "sell": sell,
             "qty": qty,
-            "filled": False
+            "open": False
         })
 
-    return orders
+    return low, high, orders
+
+def calc_pnl(buy, sell, qty):
+    gross = (sell - buy) * qty
+    fee = (buy * qty * MAKER_FEE) + (sell * qty * TAKER_FEE)
+    return gross - fee
+
+# ================== RISK CHECK ==================
+async def risk_check():
+    global BOT_MODE
+
+    daily_roi = DAILY_PNL / DEPOSIT
+    weekly_roi = WEEKLY_PNL / DEPOSIT
+
+    if BOT_MODE == "ACTIVE":
+        if daily_roi <= DAILY_STOP_LOSS_PCT or daily_roi >= DAILY_TAKE_PROFIT_PCT:
+            BOT_MODE = "PAUSE_DAY"
+            ACTIVE_GRIDS.clear()
+            await bot.send_message(
+                ADMIN_ID,
+                f"⏸ DAILY LIMIT HIT\nDaily PnL: {DAILY_PNL:.2f}$\n{BTC_CONTEXT}"
+            )
+
+        elif weekly_roi <= WEEKLY_STOP_LOSS_PCT or weekly_roi >= WEEKLY_TAKE_PROFIT_PCT:
+            BOT_MODE = "PAUSE_WEEK"
+            ACTIVE_GRIDS.clear()
+            await bot.send_message(
+                ADMIN_ID,
+                f"⏸ WEEKLY LIMIT HIT\nWeekly PnL: {WEEKLY_PNL:.2f}$\n{BTC_CONTEXT}"
+            )
 
 # ================== ENGINE ==================
 async def grid_engine():
-    global GRID_ACTIVE, GRID_SIDE, ENTRY_PRICE
-    global TOTAL_PNL, DAILY_PNL, TOTAL_DEALS, MODE, GRID_ORDERS
+    global TOTAL_PNL, DAILY_PNL, WEEKLY_PNL, DEALS
+    global LAST_DAY, LAST_WEEK, BOT_MODE
 
     while True:
-        if MODE != "ACTIVE":
+        await update_btc_context()
+
+        now = datetime.utcnow()
+
+        if now.date() != LAST_DAY:
+            DAILY_PNL = 0.0
+            LAST_DAY = now.date()
+            if BOT_MODE == "PAUSE_DAY":
+                BOT_MODE = "ACTIVE"
+
+        week = now.isocalendar().week
+        if week != LAST_WEEK:
+            WEEKLY_PNL = 0.0
+            LAST_WEEK = week
+            if BOT_MODE == "PAUSE_WEEK":
+                BOT_MODE = "ACTIVE"
+
+        await risk_check()
+
+        if BOT_MODE != "ACTIVE":
             await asyncio.sleep(SCAN_INTERVAL)
             continue
 
-        kl = await get_klines(limit=2)
-        price = float(kl[-1][4])
+        for pair, g in list(ACTIVE_GRIDS.items()):
+            kl = await get_klines(pair, limit=2)
+            price = float(kl[-1][4])
 
-        if not GRID_ACTIVE:
-            side = await detect_direction()
-            if not side:
-                await asyncio.sleep(SCAN_INTERVAL)
+            if price < g["low"] or price > g["high"]:
+                del ACTIVE_GRIDS[pair]
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🛑 GRID STOP (ATR)\n{pair}\n{BTC_CONTEXT}"
+                )
                 continue
 
-            GRID_SIDE = side
-            ENTRY_PRICE = price
-            GRID_ORDERS = build_grid(price, side)
-            GRID_ACTIVE = True
+            for o in g["orders"]:
+                if not o["open"] and price <= o["buy"]:
+                    o["open"] = True
+                elif o["open"] and price >= o["sell"]:
+                    pnl = calc_pnl(o["buy"], o["sell"], o["qty"])
+                    TOTAL_PNL += pnl
+                    DAILY_PNL += pnl
+                    WEEKLY_PNL += pnl
+                    DEALS += 1
+                    o["open"] = False
 
-            await bot.send_message(
-                ADMIN_ID,
-                f"🧠 GRID STARTED\n"
-                f"Symbol: {SYMBOL}\n"
-                f"Side: {side}\n"
-                f"Entry: {price:.4f}\n"
-                f"(DRY {DEPOSIT}$ x{LEVERAGE})"
-            )
+        if len(ACTIVE_GRIDS) < MAX_GRIDS:
+            for pair in PAIRS:
+                if pair in ACTIVE_GRIDS:
+                    continue
 
-        for o in GRID_ORDERS:
-            if o["filled"]:
-                continue
+                res = await analyze_pair(pair)
+                if not res:
+                    continue
 
-            if GRID_SIDE == "LONG" and price <= o["buy"]:
-                o["filled"] = True
+                low, high, orders = build_grid(res["price"], res["atr"])
+                ACTIVE_GRIDS[pair] = {
+                    "side": res["side"],
+                    "low": low,
+                    "high": high,
+                    "orders": orders
+                }
 
-            elif GRID_SIDE == "SHORT" and price >= o["buy"]:
-                o["filled"] = True
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🧱 GRID START\n"
+                    f"{pair}\n"
+                    f"Side: {res['side']}\n"
+                    f"{BTC_CONTEXT}"
+                )
 
-            elif o["filled"]:
-                pnl, roi = calc_pnl(ENTRY_PRICE, price, o["qty"])
-                TOTAL_PNL += pnl
-                DAILY_PNL += pnl
-                TOTAL_DEALS += 1
-
-        daily_roi = DAILY_PNL / DEPOSIT
-        if daily_roi >= DAILY_PROFIT_CAP or daily_roi <= DAILY_LOSS_CAP:
-            MODE = "PAUSE"
-            GRID_ACTIVE = False
-            await bot.send_message(
-                ADMIN_ID,
-                "🧯 GRID PAUSED\n"
-                f"Daily PnL: {DAILY_PNL:.2f}$"
-            )
+                if len(ACTIVE_GRIDS) >= MAX_GRIDS:
+                    break
 
         await asyncio.sleep(SCAN_INTERVAL)
 
@@ -191,41 +288,27 @@ async def grid_engine():
 async def heartbeat():
     while True:
         uptime = int((time.time() - START_TS) / 60)
-
-        text = (
+        await bot.send_message(
+            ADMIN_ID,
             "✅ GRID BOT ONLINE\n\n"
-            f"Mode: {MODE}\n"
-            f"Symbol: {SYMBOL}\n"
-            f"TF: {TIMEFRAME}\n"
-            f"Grid: {'ON' if GRID_ACTIVE else 'OFF'}\n"
-            f"Deals: {TOTAL_DEALS}\n"
-            f"Total PnL: {TOTAL_PNL:.2f}$\n"
-            f"Daily PnL: {DAILY_PNL:.2f}$\n"
+            f"{BTC_CONTEXT}\n"
+            f"Mode: {BOT_MODE}\n"
+            f"Grids: {', '.join(ACTIVE_GRIDS) if ACTIVE_GRIDS else 'нет'}\n"
+            f"Deals: {DEALS}\n"
+            f"Total: {TOTAL_PNL:.2f}$\n"
+            f"Daily: {DAILY_PNL:.2f}$\n"
+            f"Weekly: {WEEKLY_PNL:.2f}$\n"
             f"Uptime: {uptime} min\n"
             f"(DRY {DEPOSIT}$ x{LEVERAGE})"
         )
-
-        try:
-            await bot.send_message(ADMIN_ID, text)
-        except Exception:
-            pass
-
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 # ================== COMMANDS ==================
-@dp.message(Command("status"))
-async def status(msg: types.Message):
+@dp.message(Command("start"))
+async def start(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-
-    await msg.answer(
-        f"📊 STATUS\n"
-        f"Mode: {MODE}\n"
-        f"Grid: {'ON' if GRID_ACTIVE else 'OFF'}\n"
-        f"Deals: {TOTAL_DEALS}\n"
-        f"Total PnL: {TOTAL_PNL:.2f}$\n"
-        f"Daily PnL: {DAILY_PNL:.2f}$"
-    )
+    await msg.answer("🤖 GRID BOT RUNNING\n" + BTC_CONTEXT)
 
 # ================== MAIN ==================
 async def main():
