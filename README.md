@@ -1,0 +1,2 @@
+# greed-bot
+test
