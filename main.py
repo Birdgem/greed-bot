@@ -19,6 +19,7 @@ PAIRS = ["SOLUSDT", "ETHUSDT", "BTCUSDT"]
 TIMEFRAME = "5m"
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
+FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 
 # ---- DRY RUN ----
 DEPOSIT = 100.0
@@ -31,7 +32,6 @@ TAKER_FEE = 0.0004
 
 ATR_PERIOD = 14
 ATR_MULT = 2.5
-GRID_LEVELS = 8
 
 SCAN_INTERVAL = 20
 HEARTBEAT_INTERVAL = 1800
@@ -42,10 +42,13 @@ DAILY_TAKE_PROFIT_PCT = 0.05
 WEEKLY_STOP_LOSS_PCT = -0.08
 WEEKLY_TAKE_PROFIT_PCT = 0.12
 
+# ---- FUNDING ----
+FUNDING_WARN_PCT = 0.03  # 0.03%
+
 # ================== STATE ==================
 START_TS = time.time()
 
-BOT_MODE = "ACTIVE"  # ACTIVE / PAUSE_DAY / PAUSE_WEEK
+BOT_MODE = "ACTIVE"
 
 ACTIVE_GRIDS = {}
 
@@ -54,12 +57,13 @@ DAILY_PNL = 0.0
 WEEKLY_PNL = 0.0
 DEALS = 0
 
-PAIR_STATS = {}  # pair -> {"pnl": float, "deals": int}
+PAIR_STATS = {}
 
 LAST_DAY = datetime.utcnow().date()
 LAST_WEEK = datetime.utcnow().isocalendar().week
 
 BTC_CONTEXT = "⚪ BTC FLAT"
+FUNDING_CACHE = {}
 
 # ================== INDICATORS ==================
 def ema(data, period):
@@ -82,19 +86,34 @@ def atr(highs, lows, closes):
         trs.append(tr)
     return mean(trs[-ATR_PERIOD:]) if len(trs) >= ATR_PERIOD else None
 
+def grid_levels_by_atr(price, atr_val):
+    atr_pct = (atr_val / price) * 100
+    if atr_pct < 0.4:
+        return 10
+    elif atr_pct < 0.8:
+        return 8
+    return 6
+
 # ================== BINANCE ==================
 async def get_klines(symbol, limit=120):
     async with aiohttp.ClientSession() as s:
         async with s.get(
             BINANCE_URL,
-            params={
-                "symbol": symbol,
-                "interval": TIMEFRAME,
-                "limit": limit
-            }
+            params={"symbol": symbol, "interval": TIMEFRAME, "limit": limit}
         ) as r:
             data = await r.json()
             return data if isinstance(data, list) else []
+
+async def get_funding(symbol):
+    async with aiohttp.ClientSession() as s:
+        async with s.get(
+            FUNDING_URL,
+            params={"symbol": symbol, "limit": 1}
+        ) as r:
+            data = await r.json()
+            if isinstance(data, list) and data:
+                return float(data[-1]["fundingRate"]) * 100
+    return 0.0
 
 # ================== BTC CONTEXT ==================
 async def update_btc_context():
@@ -109,9 +128,6 @@ async def update_btc_context():
 
     ema7 = ema(closes, 7)
     ema25 = ema(closes, 25)
-
-    if not ema7 or not ema25:
-        return
 
     if price > ema7 > ema25:
         BTC_CONTEXT = "🟢 BTC BULL"
@@ -153,17 +169,19 @@ async def analyze_pair(pair):
 
 # ================== GRID ==================
 def build_grid(price, atr_val):
+    levels = grid_levels_by_atr(price, atr_val)
+
     rng = atr_val * ATR_MULT
     low = price - rng
     high = price + rng
 
-    step = (high - low) / GRID_LEVELS
+    step = (high - low) / levels
     margin = DEPOSIT * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
-    qty = (notional / price) / GRID_LEVELS
+    qty = (notional / price) / levels
 
     orders = []
-    for i in range(GRID_LEVELS):
+    for i in range(levels):
         buy = low + step * i
         sell = buy + step
         orders.append({
@@ -173,7 +191,7 @@ def build_grid(price, atr_val):
             "open": False
         })
 
-    return low, high, orders
+    return low, high, orders, levels
 
 def calc_pnl(buy, sell, qty):
     gross = (sell - buy) * qty
@@ -212,6 +230,9 @@ async def grid_engine():
     while True:
         await update_btc_context()
 
+        for p in PAIRS:
+            FUNDING_CACHE[p] = await get_funding(p)
+
         now = datetime.utcnow()
 
         if now.date() != LAST_DAY:
@@ -233,6 +254,7 @@ async def grid_engine():
             await asyncio.sleep(SCAN_INTERVAL)
             continue
 
+        # --- update active grids ---
         for pair, g in list(ACTIVE_GRIDS.items()):
             kl = await get_klines(pair, limit=2)
             price = float(kl[-1][4])
@@ -261,6 +283,7 @@ async def grid_engine():
 
                     o["open"] = False
 
+        # --- start new grids ---
         if len(ACTIVE_GRIDS) < MAX_GRIDS:
             for pair in PAIRS:
                 if pair in ACTIVE_GRIDS:
@@ -270,7 +293,7 @@ async def grid_engine():
                 if not res:
                     continue
 
-                low, high, orders = build_grid(res["price"], res["atr"])
+                low, high, orders, levels = build_grid(res["price"], res["atr"])
                 ACTIVE_GRIDS[pair] = {
                     "side": res["side"],
                     "low": low,
@@ -278,11 +301,20 @@ async def grid_engine():
                     "orders": orders
                 }
 
+                funding = FUNDING_CACHE.get(pair, 0.0)
+                warn = ""
+                if res["side"] == "LONG" and funding > FUNDING_WARN_PCT:
+                    warn = " ⚠️"
+                elif res["side"] == "SHORT" and funding < -FUNDING_WARN_PCT:
+                    warn = " ⚠️"
+
                 await bot.send_message(
                     ADMIN_ID,
                     f"🧱 GRID START\n"
                     f"{pair}\n"
                     f"Side: {res['side']}\n"
+                    f"Levels: {levels}\n"
+                    f"Funding: {funding:+.3f}%{warn}\n"
                     f"{BTC_CONTEXT}"
                 )
 
@@ -295,19 +327,28 @@ async def grid_engine():
 async def heartbeat():
     while True:
         uptime = int((time.time() - START_TS) / 60)
-        await bot.send_message(
-            ADMIN_ID,
-            "✅ GRID BOT ONLINE\n\n"
-            f"{BTC_CONTEXT}\n"
-            f"Mode: {BOT_MODE}\n"
-            f"Grids: {', '.join(ACTIVE_GRIDS) if ACTIVE_GRIDS else 'нет'}\n"
-            f"Deals: {DEALS}\n"
-            f"Total: {TOTAL_PNL:.2f}$\n"
-            f"Daily: {DAILY_PNL:.2f}$\n"
-            f"Weekly: {WEEKLY_PNL:.2f}$\n"
-            f"Uptime: {uptime} min\n"
-            f"(DRY {DEPOSIT}$ x{LEVERAGE})"
-        )
+
+        lines = [
+            "✅ GRID BOT ONLINE",
+            "",
+            BTC_CONTEXT,
+            f"Mode: {BOT_MODE}",
+            f"Grids: {', '.join(ACTIVE_GRIDS) if ACTIVE_GRIDS else 'нет'}",
+            f"Deals: {DEALS}",
+            f"Total: {TOTAL_PNL:.2f}$",
+            f"Daily: {DAILY_PNL:.2f}$",
+            f"Weekly: {WEEKLY_PNL:.2f}$",
+            "",
+            "Funding:"
+        ]
+
+        for p, f in FUNDING_CACHE.items():
+            lines.append(f"• {p}: {f:+.3f}%")
+
+        lines.append(f"\nUptime: {uptime} min")
+        lines.append(f"(DRY {DEPOSIT}$ x{LEVERAGE})")
+
+        await bot.send_message(ADMIN_ID, "\n".join(lines))
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 # ================== COMMANDS ==================
@@ -323,9 +364,11 @@ async def stats(msg: types.Message):
         return
 
     lines = [
-        "📊 STATISTICS\n",
+        "📊 STATISTICS",
+        "",
         BTC_CONTEXT,
-        f"Mode: {BOT_MODE}\n",
+        f"Mode: {BOT_MODE}",
+        "",
         "Pairs:"
     ]
 
@@ -337,13 +380,17 @@ async def stats(msg: types.Message):
 
     uptime = int((time.time() - START_TS) / 60)
 
-    lines.append("\nTotal:")
-    lines.append(f"• Deals: {DEALS}")
-    lines.append(f"• Total PnL: {TOTAL_PNL:.2f}$")
-    lines.append(f"• Daily: {DAILY_PNL:.2f}$")
-    lines.append(f"• Weekly: {WEEKLY_PNL:.2f}$")
-    lines.append(f"\nUptime: {uptime} min")
-    lines.append(f"(DRY {DEPOSIT}$ x{LEVERAGE})")
+    lines += [
+        "",
+        "Total:",
+        f"• Deals: {DEALS}",
+        f"• Total PnL: {TOTAL_PNL:.2f}$",
+        f"• Daily: {DAILY_PNL:.2f}$",
+        f"• Weekly: {WEEKLY_PNL:.2f}$",
+        f"",
+        f"Uptime: {uptime} min",
+        f"(DRY {DEPOSIT}$ x{LEVERAGE})"
+    ]
 
     await msg.answer("\n".join(lines))
 
