@@ -49,6 +49,7 @@ START_TS = time.time()
 
 ACTIVE_PAIRS = ["BTCUSDT", "ETHUSDT"]
 ACTIVE_GRIDS = {}
+LAST_REJECT_REASON = {}
 
 PAIR_STATS = {}
 
@@ -102,23 +103,6 @@ def load_state():
     MAX_EQUITY = d.get("MAX_EQUITY", DEPOSIT)
     MAX_DRAWDOWN = d.get("MAX_DRAWDOWN", 0.0)
 
-# ================== TRADE LOG ==================
-def log_trade(pair, side, entry, exit, qty, pnl):
-    equity = DEPOSIT + TOTAL_PNL
-    new = not os.path.exists(TRADES_FILE)
-    with open(TRADES_FILE, "a", newline="") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(["time","pair","side","entry","exit","qty","pnl","equity"])
-        w.writerow([
-            datetime.utcnow().isoformat(),
-            pair, side,
-            round(entry,6), round(exit,6),
-            round(qty,6),
-            round(pnl,4),
-            round(equity,4)
-        ])
-
 # ================== INDICATORS ==================
 def ema(data, p):
     k = 2 / (p + 1)
@@ -137,14 +121,14 @@ def atr(highs, lows, closes):
         ))
     return mean(tr[-ATR_PERIOD:]) if len(tr) >= ATR_PERIOD else None
 
-def atr_mult(price, atr):
-    pct = atr / price * 100
+def atr_mult(price, atr_val):
+    pct = atr_val / price * 100
     if pct < 0.4: return 3.5
     if pct < 0.8: return 2.5
     return 1.8
 
-def grid_levels(price, atr):
-    pct = atr / price * 100
+def grid_levels(price, atr_val):
+    pct = atr_val / price * 100
     if pct < 0.4: return 10
     if pct < 0.8: return 8
     return 6
@@ -154,7 +138,7 @@ async def get_klines(symbol, limit=120):
     async with aiohttp.ClientSession() as s:
         async with s.get(
             BINANCE_URL,
-            params={"symbol":symbol,"interval":TIMEFRAME,"limit":limit}
+            params={"symbol": symbol, "interval": TIMEFRAME, "limit": limit}
         ) as r:
             d = await r.json()
             return d if isinstance(d, list) else []
@@ -163,6 +147,7 @@ async def get_klines(symbol, limit=120):
 async def analyze_pair(pair):
     kl = await get_klines(pair)
     if len(kl) < 50:
+        LAST_REJECT_REASON[pair] = "not enough candles"
         return None
 
     c = [float(k[4]) for k in kl]
@@ -170,11 +155,12 @@ async def analyze_pair(pair):
     l = [float(k[3]) for k in kl]
 
     price = c[-1]
-    e7 = ema(c,7)
-    e25 = ema(c,25)
-    a = atr(h,l,c)
+    e7 = ema(c, 7)
+    e25 = ema(c, 25)
+    a = atr(h, l, c)
 
     if not a:
+        LAST_REJECT_REASON[pair] = "ATR unavailable"
         return None
 
     if price > e7 > e25:
@@ -182,9 +168,10 @@ async def analyze_pair(pair):
     elif price < e7 < e25:
         side = "SHORT"
     else:
+        LAST_REJECT_REASON[pair] = "trend FLAT"
         return None
 
-    return {"price":price,"side":side,"atr":a}
+    return {"price": price, "side": side, "atr": a}
 
 # ================== GRID ==================
 def build_grid(price, atr_val, side):
@@ -216,13 +203,18 @@ def build_grid(price, atr_val, side):
         if exp - fees < MIN_EXPECTED_PNL:
             continue
 
-        orders.append({"entry":entry,"exit":exit,"qty":qty,"open":False})
+        orders.append({"entry": entry, "exit": exit, "qty": qty, "open": False})
 
-    return None if len(orders) < 3 else {
+    if len(orders) < 3:
+        LAST_REJECT_REASON["grid"] = "orders filtered"
+        return None
+
+    return {
         "side": side,
         "low": min(low, high),
         "high": max(low, high),
-        "orders": orders
+        "orders": orders,
+        "atr": atr_val
     }
 
 def calc_pnl(entry, exit, qty, side):
@@ -271,11 +263,10 @@ async def grid_engine():
                             (equity - MAX_EQUITY) / MAX_EQUITY * 100
                         )
 
-                        PAIR_STATS.setdefault(pair, {"pnl":0,"deals":0})
+                        PAIR_STATS.setdefault(pair, {"pnl": 0.0, "deals": 0})
                         PAIR_STATS[pair]["pnl"] += pnl
                         PAIR_STATS[pair]["deals"] += 1
 
-                        log_trade(pair, g["side"], o["entry"], o["exit"], o["qty"], pnl)
                         o["open"] = False
                         save_state()
 
@@ -321,85 +312,37 @@ async def heartbeat():
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 # ================== COMMANDS ==================
-@dp.message(Command("start"))
-async def cmd_start(msg: types.Message):
-    if msg.from_user.id == ADMIN_ID:
-        await msg.answer("🤖 GRID BOT RUNNING")
-
-@dp.message(Command("pairs"))
-async def cmd_pairs(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    await msg.answer("📊 Active pairs:\n" + "\n".join(f"• {p}" for p in ACTIVE_PAIRS))
-
-@dp.message(Command("pair"))
-async def cmd_pair(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-
-    parts = msg.text.split()
-    if len(parts) != 3:
-        await msg.answer("Используй: /pair add|remove SYMBOL")
-        return
-
-    action, pair = parts[1], parts[2].upper()
-
-    if pair not in ALL_PAIRS:
-        await msg.answer("❌ Пара не разрешена")
-        return
-
-    if action == "add":
-        if pair not in ACTIVE_PAIRS:
-            ACTIVE_PAIRS.append(pair)
-            save_state()
-            await msg.answer(f"✅ {pair} добавлена")
-        else:
-            await msg.answer("Уже активна")
-
-    elif action == "remove":
-        if pair in ACTIVE_PAIRS:
-            ACTIVE_PAIRS.remove(pair)
-            ACTIVE_GRIDS.pop(pair, None)
-            save_state()
-            await msg.answer(f"🛑 {pair} удалена")
-        else:
-            await msg.answer("Пара не активна")
-
-    else:
-        await msg.answer("Команда: /pair add|remove SYMBOL")
-
 @dp.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
 
-    equity = DEPOSIT + TOTAL_PNL
-    roi = (equity - DEPOSIT) / DEPOSIT * 100
-    pf = abs(GROSS_PROFIT / GROSS_LOSS) if GROSS_LOSS != 0 else float("inf")
-    avg = TOTAL_PNL / DEALS if DEALS else 0
-    wr = (WIN_TRADES / DEALS * 100) if DEALS else 0
+    lines = ["📊 GRID BOT STATUS", ""]
 
-    lines = [
-        "📊 GRID BOT STATS",
-        "",
-        f"Equity: {equity:.2f}$",
-        f"ROI: {roi:.2f}%",
-        f"Max DD: {MAX_DRAWDOWN:.2f}%",
-        "",
-        f"Deals: {DEALS}",
-        f"Avg PnL / trade: {avg:.3f}$",
-        f"Win rate: {wr:.1f}%",
-        f"Profit factor: {pf:.2f}",
-        "",
-        "Pairs:"
-    ]
+    if ACTIVE_GRIDS:
+        for p, g in ACTIVE_GRIDS.items():
+            open_o = sum(1 for o in g["orders"] if o["open"])
+            lines.append(
+                f"• {p} {g['side']} | {open_o}/{len(g['orders'])} open "
+                f"| {g['low']:.6f} → {g['high']:.6f} | ATR {g['atr']:.6f}"
+            )
+    else:
+        lines.append("No active grids")
 
-    for p, s in PAIR_STATS.items():
-        lines.append(f"• {p}: {s['pnl']:.2f}$ ({s['deals']} deals)")
+    await msg.answer("\n".join(lines))
 
-    lines.append("")
-    lines.append("Active pairs:")
-    lines.append(", ".join(ACTIVE_PAIRS))
+@dp.message(Command("why"))
+async def cmd_why(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    lines = ["🤔 WHY NO TRADES", ""]
+
+    for p in ACTIVE_PAIRS:
+        if p in ACTIVE_GRIDS:
+            lines.append(f"{p}: grid active")
+        else:
+            lines.append(f"{p}: {LAST_REJECT_REASON.get(p, 'no signal yet')}")
 
     await msg.answer("\n".join(lines))
 
