@@ -1,3 +1,5 @@
+# ====== FULL FILE main.py ======
+
 import os
 import json
 import csv
@@ -47,12 +49,11 @@ MIN_EXPECTED_PNL = 0.05
 # ================== STATE ==================
 START_TS = time.time()
 
-ACTIVE_PAIRS = ["BTCUSDT", "ETHUSDT"]
+ACTIVE_PAIRS = ["HUSDT", "CYSUSDT"]
 ACTIVE_GRIDS = {}
 LAST_REJECT_REASON = {}
 
 PAIR_STATS = {}
-
 TOTAL_PNL = 0.0
 DEALS = 0
 WIN_TRADES = 0
@@ -121,24 +122,24 @@ def atr(highs, lows, closes):
         ))
     return mean(tr[-ATR_PERIOD:]) if len(tr) >= ATR_PERIOD else None
 
-def atr_mult(price, atr_val):
-    pct = atr_val / price * 100
-    if pct < 0.4: return 3.5
-    if pct < 0.8: return 2.5
-    return 1.8
-
-def grid_levels(price, atr_val):
-    pct = atr_val / price * 100
+def grid_levels(price, atr):
+    pct = atr / price * 100
     if pct < 0.4: return 10
     if pct < 0.8: return 8
     return 6
+
+def atr_mult(price, atr):
+    pct = atr / price * 100
+    if pct < 0.4: return 3.5
+    if pct < 0.8: return 2.5
+    return 1.8
 
 # ================== BINANCE ==================
 async def get_klines(symbol, limit=120):
     async with aiohttp.ClientSession() as s:
         async with s.get(
             BINANCE_URL,
-            params={"symbol": symbol, "interval": TIMEFRAME, "limit": limit}
+            params={"symbol":symbol,"interval":TIMEFRAME,"limit":limit}
         ) as r:
             d = await r.json()
             return d if isinstance(d, list) else []
@@ -155,36 +156,33 @@ async def analyze_pair(pair):
     l = [float(k[3]) for k in kl]
 
     price = c[-1]
-    e7 = ema(c, 7)
-    e25 = ema(c, 25)
-    a = atr(h, l, c)
+    e7 = ema(c,7)
+    e25 = ema(c,25)
+    a = atr(h,l,c)
 
     if not a:
         LAST_REJECT_REASON[pair] = "ATR unavailable"
         return None
 
+    # 🔥 ВАЖНО: FLAT РАЗРЕШЁН
     if price > e7 > e25:
         side = "LONG"
     elif price < e7 < e25:
         side = "SHORT"
     else:
-        LAST_REJECT_REASON[pair] = "trend FLAT"
-        return None
+        side = "FLAT"
 
-    return {"price": price, "side": side, "atr": a}
+    return {"price":price,"side":side,"atr":a}
 
 # ================== GRID ==================
 def build_grid(price, atr_val, side):
     levels = grid_levels(price, atr_val)
     rng = atr_val * atr_mult(price, atr_val)
 
-    low, high = (
-        (price - rng, price + rng)
-        if side == "LONG"
-        else (price + rng, price - rng)
-    )
+    low = price - rng
+    high = price + rng
 
-    step = abs(high - low) / levels
+    step = (high - low) / levels
     margin = DEPOSIT * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
     qty = (notional / price) / levels
@@ -192,8 +190,12 @@ def build_grid(price, atr_val, side):
     orders = []
 
     for i in range(levels):
-        entry = low + step * i if side == "LONG" else low - step * i
-        exit = entry + step if side == "LONG" else entry - step
+        if side == "SHORT":
+            entry = high - step * i
+            exit = entry - step
+        else:
+            entry = low + step * i
+            exit = entry + step
 
         exp = abs(exit - entry) * qty
         fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
@@ -203,7 +205,7 @@ def build_grid(price, atr_val, side):
         if exp - fees < MIN_EXPECTED_PNL:
             continue
 
-        orders.append({"entry": entry, "exit": exit, "qty": qty, "open": False})
+        orders.append({"entry":entry,"exit":exit,"qty":qty,"open":False})
 
     if len(orders) < 3:
         LAST_REJECT_REASON["grid"] = "orders filtered"
@@ -211,14 +213,17 @@ def build_grid(price, atr_val, side):
 
     return {
         "side": side,
-        "low": min(low, high),
-        "high": max(low, high),
+        "low": low,
+        "high": high,
         "orders": orders,
         "atr": atr_val
     }
 
 def calc_pnl(entry, exit, qty, side):
-    gross = (exit - entry) * qty if side == "LONG" else (entry - exit) * qty
+    if side == "SHORT":
+        gross = (entry - exit) * qty
+    else:
+        gross = (exit - entry) * qty
     fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
     return gross - fees
 
@@ -238,11 +243,11 @@ async def grid_engine():
 
             for o in g["orders"]:
                 if not o["open"]:
-                    if (g["side"] == "LONG" and price <= o["entry"]) or \
+                    if (g["side"] != "SHORT" and price <= o["entry"]) or \
                        (g["side"] == "SHORT" and price >= o["entry"]):
                         o["open"] = True
                 else:
-                    if (g["side"] == "LONG" and price >= o["exit"]) or \
+                    if (g["side"] != "SHORT" and price >= o["exit"]) or \
                        (g["side"] == "SHORT" and price <= o["exit"]):
 
                         pnl = calc_pnl(o["entry"], o["exit"], o["qty"], g["side"])
@@ -263,7 +268,7 @@ async def grid_engine():
                             (equity - MAX_EQUITY) / MAX_EQUITY * 100
                         )
 
-                        PAIR_STATS.setdefault(pair, {"pnl": 0.0, "deals": 0})
+                        PAIR_STATS.setdefault(pair, {"pnl":0,"deals":0})
                         PAIR_STATS[pair]["pnl"] += pnl
                         PAIR_STATS[pair]["deals"] += 1
 
@@ -304,7 +309,7 @@ async def heartbeat():
             ADMIN_ID,
             f"📊 GRID BOT\n"
             f"Equity: {equity:.2f}$ | ROI: {roi:.2f}%\n"
-            f"Avg PnL: {avg:.3f}$ | WinRate: {wr:.1f}% | PF: {pf:.2f}\n"
+            f"Avg: {avg:.3f}$ | WinRate: {wr:.1f}% | PF: {pf:.2f}\n"
             f"Deals: {DEALS} | Max DD: {MAX_DRAWDOWN:.2f}%\n"
             f"Active grids: {len(ACTIVE_GRIDS)}/{MAX_GRIDS}"
         )
@@ -318,16 +323,16 @@ async def cmd_stats(msg: types.Message):
         return
 
     lines = ["📊 GRID BOT STATUS", ""]
-
-    if ACTIVE_GRIDS:
-        for p, g in ACTIVE_GRIDS.items():
+    for p in ACTIVE_PAIRS:
+        if p in ACTIVE_GRIDS:
+            g = ACTIVE_GRIDS[p]
             open_o = sum(1 for o in g["orders"] if o["open"])
             lines.append(
-                f"• {p} {g['side']} | {open_o}/{len(g['orders'])} open "
-                f"| {g['low']:.6f} → {g['high']:.6f} | ATR {g['atr']:.6f}"
+                f"{p}: {g['side']} | {open_o}/{len(g['orders'])} "
+                f"| ATR {g['atr']:.6f}"
             )
-    else:
-        lines.append("No active grids")
+        else:
+            lines.append(f"{p}: idle")
 
     await msg.answer("\n".join(lines))
 
@@ -336,13 +341,9 @@ async def cmd_why(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
 
-    lines = ["🤔 WHY NO TRADES", ""]
-
+    lines = ["🤔 WHY NO GRID", ""]
     for p in ACTIVE_PAIRS:
-        if p in ACTIVE_GRIDS:
-            lines.append(f"{p}: grid active")
-        else:
-            lines.append(f"{p}: {LAST_REJECT_REASON.get(p, 'no signal yet')}")
+        lines.append(f"{p}: {LAST_REJECT_REASON.get(p,'waiting')}")
 
     await msg.answer("\n".join(lines))
 
