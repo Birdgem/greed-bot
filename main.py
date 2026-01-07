@@ -1,11 +1,8 @@
-# ====== FULL FILE main.py ======
-
 import os
 import json
 import asyncio
 import aiohttp
 import time
-from statistics import mean
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -20,209 +17,206 @@ dp = Dispatcher()
 STATE_FILE = "state.json"
 
 # ================== SETTINGS ==================
-ALL_PAIRS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT",
-    "BNBUSDT", "DOGEUSDT", "AVAXUSDT",
-    "HUSDT", "CYSUSDT"
-]
-
 TIMEFRAME = "5m"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
 DEPOSIT = 100.0
-LEVERAGE = 10
-MAX_GRIDS = 2
-MAX_MARGIN_PER_GRID = 0.10
-
-MAKER_FEE = 0.0002
-TAKER_FEE = 0.0004
-
-ATR_PERIOD = 14
-SCAN_INTERVAL = 20
+GRID_LEVELS = 10          # как в Binance Grid
+GRID_RANGE_PCT = 4.0      # ±2% от цены
+SCAN_INTERVAL = 10
 HEARTBEAT_INTERVAL = 1800
 
-MIN_ORDER_NOTIONAL = 5.0
-MIN_EXPECTED_PNL = 0.05
+FEE = 0.0004  # условная комиссия
 
 # ================== STATE ==================
 START_TS = time.time()
 
-ACTIVE_PAIRS = ["BTCUSDT", "ETHUSDT"]
-ACTIVE_GRIDS = {}
-LAST_REJECT_REASON = {}
-
-PAIR_STATS = {}
+ACTIVE_PAIRS = ["BTCUSDT"]
+GRIDS = {}               # pair -> grid
+LAST_REASON = {}         # pair -> reason
 
 TOTAL_PNL = 0.0
 DEALS = 0
-WIN_TRADES = 0
-LOSS_TRADES = 0
-GROSS_PROFIT = 0.0
-GROSS_LOSS = 0.0
-
-MAX_EQUITY = DEPOSIT
-MAX_DRAWDOWN = 0.0
+WIN = 0
+LOSS = 0
 
 # ================== STATE IO ==================
 def save_state():
     with open(STATE_FILE, "w") as f:
         json.dump({
             "ACTIVE_PAIRS": ACTIVE_PAIRS,
-            "ACTIVE_GRIDS": ACTIVE_GRIDS,
-            "PAIR_STATS": PAIR_STATS,
+            "GRIDS": GRIDS,
             "TOTAL_PNL": TOTAL_PNL,
             "DEALS": DEALS,
-            "WIN_TRADES": WIN_TRADES,
-            "LOSS_TRADES": LOSS_TRADES,
-            "GROSS_PROFIT": GROSS_PROFIT,
-            "GROSS_LOSS": GROSS_LOSS,
-            "MAX_EQUITY": MAX_EQUITY,
-            "MAX_DRAWDOWN": MAX_DRAWDOWN
+            "WIN": WIN,
+            "LOSS": LOSS
         }, f)
 
 def load_state():
-    global ACTIVE_PAIRS, ACTIVE_GRIDS, PAIR_STATS
-    global TOTAL_PNL, DEALS, WIN_TRADES, LOSS_TRADES
-    global GROSS_PROFIT, GROSS_LOSS, MAX_EQUITY, MAX_DRAWDOWN
-
+    global ACTIVE_PAIRS, GRIDS, TOTAL_PNL, DEALS, WIN, LOSS
     if not os.path.exists(STATE_FILE):
         return
-
     with open(STATE_FILE) as f:
         d = json.load(f)
-
     ACTIVE_PAIRS = d.get("ACTIVE_PAIRS", ACTIVE_PAIRS)
-    ACTIVE_GRIDS = d.get("ACTIVE_GRIDS", {})
-    PAIR_STATS = d.get("PAIR_STATS", {})
+    GRIDS = d.get("GRIDS", {})
     TOTAL_PNL = d.get("TOTAL_PNL", 0.0)
     DEALS = d.get("DEALS", 0)
-    WIN_TRADES = d.get("WIN_TRADES", 0)
-    LOSS_TRADES = d.get("LOSS_TRADES", 0)
-    GROSS_PROFIT = d.get("GROSS_PROFIT", 0.0)
-    GROSS_LOSS = d.get("GROSS_LOSS", 0.0)
-    MAX_EQUITY = d.get("MAX_EQUITY", DEPOSIT)
-    MAX_DRAWDOWN = d.get("MAX_DRAWDOWN", 0.0)
-
-# ================== INDICATORS ==================
-def ema(data, p):
-    k = 2 / (p + 1)
-    e = sum(data[:p]) / p
-    for x in data[p:]:
-        e = x * k + e * (1 - k)
-    return e
-
-def atr(highs, lows, closes):
-    tr = []
-    for i in range(1, len(closes)):
-        tr.append(max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i] - closes[i-1])
-        ))
-    return mean(tr[-ATR_PERIOD:]) if len(tr) >= ATR_PERIOD else None
-
-def calc_pnl(entry, exit, qty, side):
-    gross = (exit - entry) * qty if side == "LONG" else (entry - exit) * qty
-    fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
-    return gross - fees
+    WIN = d.get("WIN", 0)
+    LOSS = d.get("LOSS", 0)
 
 # ================== BINANCE ==================
-async def get_klines(symbol, limit=120):
+async def get_price(symbol):
     async with aiohttp.ClientSession() as s:
         async with s.get(
             BINANCE_URL,
-            params={"symbol": symbol, "interval": TIMEFRAME, "limit": limit}
+            params={"symbol": symbol, "interval": TIMEFRAME, "limit": 1}
         ) as r:
             d = await r.json()
-            return d if isinstance(d, list) else []
+            if not isinstance(d, list):
+                return None
+            return float(d[-1][4])
+
+# ================== GRID ==================
+def build_grid(price):
+    half = GRID_RANGE_PCT / 2 / 100
+    low = price * (1 - half)
+    high = price * (1 + half)
+    step = (high - low) / GRID_LEVELS
+    qty = (DEPOSIT / GRID_LEVELS) / price
+
+    orders = []
+    for i in range(GRID_LEVELS):
+        buy = low + step * i
+        sell = buy + step
+        orders.append({
+            "buy": buy,
+            "sell": sell,
+            "qty": qty,
+            "open": False
+        })
+
+    return {
+        "low": low,
+        "high": high,
+        "step": step,
+        "orders": orders
+    }
+
+def calc_pnl(buy, sell, qty):
+    gross = (sell - buy) * qty
+    fee = (buy + sell) * qty * FEE
+    return gross - fee
+
+# ================== ENGINE ==================
+async def grid_engine():
+    global TOTAL_PNL, DEALS, WIN, LOSS
+
+    while True:
+        for pair in ACTIVE_PAIRS:
+            price = await get_price(pair)
+            if not price:
+                LAST_REASON[pair] = "no price"
+                continue
+
+            if pair not in GRIDS:
+                GRIDS[pair] = build_grid(price)
+                LAST_REASON[pair] = "grid started"
+                save_state()
+                continue
+
+            g = GRIDS[pair]
+
+            if not (g["low"] <= price <= g["high"]):
+                del GRIDS[pair]
+                LAST_REASON[pair] = "price left range"
+                save_state()
+                continue
+
+            for o in g["orders"]:
+                if not o["open"] and price <= o["buy"]:
+                    o["open"] = True
+                elif o["open"] and price >= o["sell"]:
+                    pnl = calc_pnl(o["buy"], o["sell"], o["qty"])
+                    TOTAL_PNL += pnl
+                    DEALS += 1
+                    WIN += 1 if pnl > 0 else 0
+                    LOSS += 1 if pnl <= 0 else 0
+                    o["open"] = False
+                    save_state()
+
+        await asyncio.sleep(SCAN_INTERVAL)
 
 # ================== COMMANDS ==================
 @dp.message(Command("pairs"))
-async def cmd_pairs(msg: types.Message):
+async def pairs(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
     await msg.answer("Active pairs:\n" + "\n".join(ACTIVE_PAIRS))
 
 @dp.message(Command("pair"))
-async def cmd_pair(msg: types.Message):
+async def pair(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-
-    parts = msg.text.split()
-    if len(parts) != 3:
+    p = msg.text.split()
+    if len(p) != 3:
         await msg.answer("Usage: /pair add|remove SYMBOL")
         return
 
-    action, pair = parts[1], parts[2].upper()
+    action, sym = p[1], p[2].upper()
 
-    if pair not in ALL_PAIRS:
-        await msg.answer("Pair not allowed")
-        return
+    if action == "add" and sym not in ACTIVE_PAIRS:
+        ACTIVE_PAIRS.append(sym)
+        save_state()
+        await msg.answer(f"✅ {sym} added")
 
-    if action == "add":
-        if pair not in ACTIVE_PAIRS:
-            ACTIVE_PAIRS.append(pair)
-            save_state()
-            await msg.answer(f"✅ {pair} added")
-        else:
-            await msg.answer("Already active")
+    elif action == "remove" and sym in ACTIVE_PAIRS:
+        ACTIVE_PAIRS.remove(sym)
+        GRIDS.pop(sym, None)
+        save_state()
+        await msg.answer(f"🛑 {sym} removed")
 
-    elif action == "remove":
-        if pair in ACTIVE_PAIRS:
-            ACTIVE_PAIRS.remove(pair)
-            ACTIVE_GRIDS.pop(pair, None)
-            save_state()
-            await msg.answer(f"🛑 {pair} removed")
-        else:
-            await msg.answer("Not active")
 @dp.message(Command("stats"))
-async def cmd_stats(msg: types.Message):
+async def stats(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
 
+    equity = DEPOSIT + TOTAL_PNL
     uptime = int((time.time() - START_TS) / 60)
 
-    equity = DEPOSIT + TOTAL_PNL
-    roi = (equity - DEPOSIT) / DEPOSIT * 100 if DEPOSIT else 0
-
-    avg_pnl = TOTAL_PNL / DEALS if DEALS else 0
-    winrate = (WIN_TRADES / DEALS * 100) if DEALS else 0
-    pf = abs(GROSS_PROFIT / GROSS_LOSS) if GROSS_LOSS != 0 else float("inf")
-
-    text = [
-        "📊 GRID BOT — STATS",
-        "",
+    lines = [
+        "📊 BINANCE GRID — BASE",
         f"Uptime: {uptime} min",
-        f"Timeframe: {TIMEFRAME}",
-        f"Scan interval: {SCAN_INTERVAL}s",
-        "",
         f"Equity: {equity:.2f}$",
-        f"ROI: {roi:.2f}%",
-        f"Deals: {DEALS}",
-        f"WinRate: {winrate:.1f}%",
-        f"Avg PnL: {avg_pnl:.4f}$",
-        f"Profit factor: {pf:.2f}",
+        f"Deals: {DEALS} | Win: {WIN} | Loss: {LOSS}",
         "",
-        f"Active grids: {len(ACTIVE_GRIDS)}/{MAX_GRIDS}",
-        "",
-        "Active pairs:",
-        ", ".join(ACTIVE_PAIRS)
+        f"Active grids: {len(GRIDS)}",
     ]
 
-    await msg.answer("\n".join(text))
+    for p, g in GRIDS.items():
+        open_o = sum(1 for o in g["orders"] if o["open"])
+        lines.append(
+            f"{p}: {g['low']:.4f} → {g['high']:.4f} | "
+            f"step {g['step']:.6f} | open {open_o}"
+        )
 
-# ================== ENGINE ==================
-async def grid_engine():
-    while True:
-        await asyncio.sleep(SCAN_INTERVAL)
+    await msg.answer("\n".join(lines))
+
+@dp.message(Command("why"))
+async def why(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    lines = ["🤔 WHY", ""]
+    for p in ACTIVE_PAIRS:
+        lines.append(f"{p}: {LAST_REASON.get(p, 'waiting')}")
+    await msg.answer("\n".join(lines))
 
 # ================== HEARTBEAT ==================
 async def heartbeat():
     while True:
-        uptime = int((time.time() - START_TS) / 60)
         await bot.send_message(
             ADMIN_ID,
-            f"📡 GRID BOT\nUptime: {uptime} min\nActive pairs: {', '.join(ACTIVE_PAIRS)}"
+            f"📡 GRID BOT ONLINE | grids: {len(GRIDS)} | pairs: {len(ACTIVE_PAIRS)}"
         )
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
