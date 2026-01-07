@@ -106,7 +106,6 @@ def load_state():
 def log_trade(pair, side, entry, exit, qty, pnl):
     equity = DEPOSIT + TOTAL_PNL
     new = not os.path.exists(TRADES_FILE)
-
     with open(TRADES_FILE, "a", newline="") as f:
         w = csv.writer(f)
         if new:
@@ -323,12 +322,54 @@ async def heartbeat():
 
 # ================== COMMANDS ==================
 @dp.message(Command("start"))
-async def start(msg: types.Message):
+async def cmd_start(msg: types.Message):
     if msg.from_user.id == ADMIN_ID:
         await msg.answer("🤖 GRID BOT RUNNING")
 
+@dp.message(Command("pairs"))
+async def cmd_pairs(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    await msg.answer("📊 Active pairs:\n" + "\n".join(f"• {p}" for p in ACTIVE_PAIRS))
+
+@dp.message(Command("pair"))
+async def cmd_pair(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    parts = msg.text.split()
+    if len(parts) != 3:
+        await msg.answer("Используй: /pair add|remove SYMBOL")
+        return
+
+    action, pair = parts[1], parts[2].upper()
+
+    if pair not in ALL_PAIRS:
+        await msg.answer("❌ Пара не разрешена")
+        return
+
+    if action == "add":
+        if pair not in ACTIVE_PAIRS:
+            ACTIVE_PAIRS.append(pair)
+            save_state()
+            await msg.answer(f"✅ {pair} добавлена")
+        else:
+            await msg.answer("Уже активна")
+
+    elif action == "remove":
+        if pair in ACTIVE_PAIRS:
+            ACTIVE_PAIRS.remove(pair)
+            ACTIVE_GRIDS.pop(pair, None)
+            save_state()
+            await msg.answer(f"🛑 {pair} удалена")
+        else:
+            await msg.answer("Пара не активна")
+
+    else:
+        await msg.answer("Команда: /pair add|remove SYMBOL")
+
 @dp.message(Command("stats"))
-async def stats(msg: types.Message):
+async def cmd_stats(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
 
