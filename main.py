@@ -22,7 +22,8 @@ TRADES_FILE = "trades.csv"
 # ================== SETTINGS ==================
 ALL_PAIRS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT",
-    "BNBUSDT", "DOGEUSDT", "AVAXUSDT", "HUSDT", "CYSUSDT"
+    "BNBUSDT", "DOGEUSDT", "AVAXUSDT",
+    "HUSDT", "CYSUSDT"
 ]
 
 TIMEFRAME = "5m"
@@ -236,16 +237,11 @@ async def grid_engine():
     global TOTAL_PNL, DEALS, MAX_EQUITY, MAX_DRAWDOWN
 
     while True:
-        # ---- UPDATE GRIDS ----
         for pair, g in list(ACTIVE_GRIDS.items()):
             kl = await get_klines(pair, limit=2)
             price = float(kl[-1][4])
 
-            if pair not in ACTIVE_PAIRS:
-                del ACTIVE_GRIDS[pair]
-                continue
-
-            if price < g["low"] or price > g["high"]:
+            if pair not in ACTIVE_PAIRS or price < g["low"] or price > g["high"]:
                 del ACTIVE_GRIDS[pair]
                 continue
 
@@ -275,7 +271,6 @@ async def grid_engine():
                         o["open"] = False
                         save_state()
 
-        # ---- START NEW GRIDS ----
         if len(ACTIVE_GRIDS) < MAX_GRIDS:
             for pair in ACTIVE_PAIRS:
                 if pair in ACTIVE_GRIDS:
@@ -323,9 +318,7 @@ async def start(msg: types.Message):
 async def show_pairs(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-    await msg.answer(
-        "📊 Active pairs:\n" + "\n".join(f"• {p}" for p in ACTIVE_PAIRS)
-    )
+    await msg.answer("📊 Active pairs:\n" + "\n".join(f"• {p}" for p in ACTIVE_PAIRS))
 
 @dp.message(Command("pair"))
 async def manage_pair(msg: types.Message):
@@ -362,6 +355,37 @@ async def manage_pair(msg: types.Message):
 
     else:
         await msg.answer("Команда: /pair add|remove SYMBOL")
+
+@dp.message(Command("stats"))
+async def stats(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    equity = DEPOSIT + TOTAL_PNL
+    roi = (equity - DEPOSIT) / DEPOSIT * 100
+
+    lines = [
+        "📊 GRID BOT STATS",
+        "",
+        f"Equity: {equity:.2f}$",
+        f"ROI: {roi:.2f}%",
+        f"Max DD: {MAX_DRAWDOWN:.2f}%",
+        f"Deals: {DEALS}",
+        "",
+        "Pairs:"
+    ]
+
+    if PAIR_STATS:
+        for p, s in PAIR_STATS.items():
+            lines.append(f"• {p}: {s['pnl']:.2f}$ ({s['deals']} deals)")
+    else:
+        lines.append("• нет данных")
+
+    lines.append("")
+    lines.append("Active pairs:")
+    lines.append(", ".join(ACTIVE_PAIRS))
+
+    await msg.answer("\n".join(lines))
 
 # ================== MAIN ==================
 async def main():
