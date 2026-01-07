@@ -22,7 +22,7 @@ TRADES_FILE = "trades.csv"
 # ================== SETTINGS ==================
 ALL_PAIRS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT",
-    "BNBUSDT", "DOGEUSDT", "AVAXUSDT"
+    "BNBUSDT", "DOGEUSDT", "AVAXUSDT", "HUSDT", "CYSUSDT"
 ]
 
 TIMEFRAME = "5m"
