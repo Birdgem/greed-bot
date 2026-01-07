@@ -278,6 +278,100 @@ async def cmd_why(msg: types.Message):
             lines.append(f"{p}: {LAST_REJECT_REASON.get(p, 'waiting')}")
 
     await msg.answer("\n".join(lines))
+    # ================== ENGINE ==================
+async def grid_engine():
+    global TOTAL_PNL, DEALS, WIN_TRADES, LOSS_TRADES
+    global GROSS_PROFIT, GROSS_LOSS, MAX_EQUITY, MAX_DRAWDOWN
+
+    while True:
+        for pair, g in list(ACTIVE_GRIDS.items()):
+            kl = await get_klines(pair, limit=2)
+            if not kl:
+                continue
+
+            price = float(kl[-1][4])
+
+            # выход из диапазона или пара отключена
+            if pair not in ACTIVE_PAIRS or not (g["low"] <= price <= g["high"]):
+                del ACTIVE_GRIDS[pair]
+                continue
+
+            for o in g["orders"]:
+                if not o["open"]:
+                    if (g["side"] == "LONG" and price <= o["entry"]) or \
+                       (g["side"] == "SHORT" and price >= o["entry"]):
+                        o["open"] = True
+                else:
+                    if (g["side"] == "LONG" and price >= o["exit"]) or \
+                       (g["side"] == "SHORT" and price <= o["exit"]):
+
+                        pnl = calc_pnl(o["entry"], o["exit"], o["qty"], g["side"])
+                        TOTAL_PNL += pnl
+                        DEALS += 1
+
+                        if pnl > 0:
+                            WIN_TRADES += 1
+                            GROSS_PROFIT += pnl
+                        else:
+                            LOSS_TRADES += 1
+                            GROSS_LOSS += pnl
+
+                        equity = DEPOSIT + TOTAL_PNL
+                        MAX_EQUITY = max(MAX_EQUITY, equity)
+                        MAX_DRAWDOWN = min(
+                            MAX_DRAWDOWN,
+                            (equity - MAX_EQUITY) / MAX_EQUITY * 100
+                        )
+
+                        PAIR_STATS.setdefault(pair, {"pnl": 0.0, "deals": 0})
+                        PAIR_STATS[pair]["pnl"] += pnl
+                        PAIR_STATS[pair]["deals"] += 1
+
+                        o["open"] = False
+                        save_state()
+
+        # старт новых сеток
+        if len(ACTIVE_GRIDS) < MAX_GRIDS:
+            for pair in ACTIVE_PAIRS:
+                if pair in ACTIVE_GRIDS:
+                    continue
+
+                res = await analyze_pair(pair)
+                if not res:
+                    continue
+
+                grid = build_grid(res["price"], res["atr"], res["side"])
+                if not grid:
+                    continue
+
+                ACTIVE_GRIDS[pair] = grid
+                save_state()
+
+                if len(ACTIVE_GRIDS) >= MAX_GRIDS:
+                    break
+
+        await asyncio.sleep(SCAN_INTERVAL)
+        # ================== HEARTBEAT ==================
+async def heartbeat():
+    while True:
+        equity = DEPOSIT + TOTAL_PNL
+        roi = (equity - DEPOSIT) / DEPOSIT * 100
+        pf = abs(GROSS_PROFIT / GROSS_LOSS) if GROSS_LOSS != 0 else float("inf")
+        avg = TOTAL_PNL / DEALS if DEALS else 0
+        wr = (WIN_TRADES / DEALS * 100) if DEALS else 0
+        uptime = int((time.time() - START_TS) / 60)
+
+        await bot.send_message(
+            ADMIN_ID,
+            f"📡 GRID BOT HEARTBEAT\n"
+            f"Uptime: {uptime} min\n"
+            f"Equity: {equity:.2f}$ | ROI: {roi:.2f}%\n"
+            f"Deals: {DEALS} | WinRate: {wr:.1f}% | PF: {pf:.2f}\n"
+            f"Active grids: {len(ACTIVE_GRIDS)}/{MAX_GRIDS}"
+        )
+
+        save_state()
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 # ================== MAIN ==================
 async def main():
