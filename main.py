@@ -1,8 +1,7 @@
-# ====== FULL FILE main.py ======
+# ====== FULL FILE main.py (FIXED PAIRS CONTROL) ======
 
 import os
 import json
-import csv
 import asyncio
 import aiohttp
 import time
@@ -19,7 +18,6 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 STATE_FILE = "state.json"
-TRADES_FILE = "trades.csv"
 
 # ================== SETTINGS ==================
 ALL_PAIRS = [
@@ -34,28 +32,32 @@ BINANCE_URL = "https://api.binance.com/api/v3/klines"
 DEPOSIT = 100.0
 LEVERAGE = 10
 MAX_GRIDS = 2
-MAX_MARGIN_PER_GRID = 0.10
-
-MAKER_FEE = 0.0002
-TAKER_FEE = 0.0004
 
 ATR_PERIOD = 14
 SCAN_INTERVAL = 20
-HEARTBEAT_INTERVAL = 1800
-
-MIN_ORDER_NOTIONAL = 5.0
-MIN_EXPECTED_PNL = 0.05
 
 # ================== STATE ==================
-START_TS = time.time()
-
 ACTIVE_PAIRS = ["BTCUSDT", "ETHUSDT"]
 ACTIVE_GRIDS = {}
 LAST_REJECT_REASON = {}
 
-PAIR_STATS = {}
-TOTAL_PNL = 0.0
-DEALS = 0
+START_TS = time.time()
+
+# ================== STATE IO ==================
+def save_state():
+    with open(STATE_FILE, "w") as f:
+        json.dump({
+            "ACTIVE_PAIRS": ACTIVE_PAIRS
+        }, f)
+
+def load_state():
+    global ACTIVE_PAIRS
+    if not os.path.exists(STATE_FILE):
+        save_state()
+        return
+    with open(STATE_FILE) as f:
+        d = json.load(f)
+    ACTIVE_PAIRS[:] = d.get("ACTIVE_PAIRS", ACTIVE_PAIRS)
 
 # ================== INDICATORS ==================
 def ema(data, p):
@@ -97,99 +99,36 @@ async def analyze_pair(pair):
     l = [float(k[3]) for k in kl]
 
     price = c[-1]
-    e7 = ema(c, 7)
-    e25 = ema(c, 25)
-    a = atr(h, l, c)
+    e7 = ema(c,7)
+    e25 = ema(c,25)
+    a = atr(h,l,c)
 
     if not a:
         LAST_REJECT_REASON[pair] = "ATR_FAIL"
         return None
 
-    # -------- MARKET MODE --------
     if price > e7 > e25:
         mode = "TREND_LONG"
-        side = "LONG"
     elif price < e7 < e25:
         mode = "TREND_SHORT"
-        side = "SHORT"
     else:
         mode = "RANGE"
-        side = "BOTH"
 
     return {
         "price": price,
         "atr": a,
-        "ema7": e7,
-        "ema25": e25,
-        "mode": mode,
-        "side": side
-    }
-
-# ================== GRID BUILDERS ==================
-def build_grid_trend(price, atr_val, side):
-    rng = atr_val * 2.5
-    levels = 8
-    low = price - rng
-    high = price + rng
-    step = (high - low) / levels
-
-    margin = DEPOSIT * MAX_MARGIN_PER_GRID
-    notional = margin * LEVERAGE
-    qty = (notional / price) / levels
-
-    orders = []
-    for i in range(levels):
-        entry = low + step * i
-        exit = entry + step
-        orders.append({
-            "entry": entry,
-            "exit": exit,
-            "qty": qty,
-            "open": False
-        })
-
-    return {
-        "mode": "TREND",
-        "side": side,
-        "low": low,
-        "high": high,
-        "orders": orders
-    }
-
-def build_grid_range(price, atr_val):
-    rng = atr_val * 1.5
-    levels = 10
-    low = price - rng
-    high = price + rng
-    step = (high - low) / levels
-
-    margin = DEPOSIT * MAX_MARGIN_PER_GRID
-    notional = margin * LEVERAGE
-    qty = (notional / price) / levels
-
-    orders = []
-    for i in range(levels):
-        buy = low + step * i
-        sell = buy + step
-        orders.append({
-            "buy": buy,
-            "sell": sell,
-            "qty": qty,
-            "open": False
-        })
-
-    return {
-        "mode": "RANGE",
-        "side": "BOTH",
-        "low": low,
-        "high": high,
-        "orders": orders
+        "mode": mode
     }
 
 # ================== ENGINE ==================
 async def grid_engine():
     while True:
-        # start grids
+        # удаляем сетки по неактивным парам
+        for pair in list(ACTIVE_GRIDS.keys()):
+            if pair not in ACTIVE_PAIRS:
+                ACTIVE_GRIDS.pop(pair, None)
+
+        # старт новых сеток
         if len(ACTIVE_GRIDS) < MAX_GRIDS:
             for pair in ACTIVE_PAIRS:
                 if pair in ACTIVE_GRIDS:
@@ -199,42 +138,78 @@ async def grid_engine():
                 if not res:
                     continue
 
-                if res["mode"] == "RANGE":
-                    grid = build_grid_range(res["price"], res["atr"])
-                else:
-                    grid = build_grid_trend(res["price"], res["atr"], res["side"])
+                ACTIVE_GRIDS[pair] = {
+                    "mode": res["mode"],
+                    "started": datetime.utcnow().isoformat()
+                }
 
-                ACTIVE_GRIDS[pair] = grid
+                if len(ACTIVE_GRIDS) >= MAX_GRIDS:
+                    break
 
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ================== COMMANDS ==================
+@dp.message(Command("pairs"))
+async def cmd_pairs(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    await msg.answer(
+        "📊 Active pairs:\n" + "\n".join(f"• {p}" for p in ACTIVE_PAIRS)
+    )
+
+@dp.message(Command("pair"))
+async def cmd_pair(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    parts = msg.text.split()
+    if len(parts) != 3:
+        await msg.answer("Используй: /pair add|remove SYMBOL")
+        return
+
+    action, pair = parts[1], parts[2].upper()
+
+    if pair not in ALL_PAIRS:
+        await msg.answer("❌ Пара не разрешена")
+        return
+
+    if action == "add":
+        if pair not in ACTIVE_PAIRS:
+            ACTIVE_PAIRS.append(pair)
+            save_state()
+            await msg.answer(f"✅ {pair} добавлена")
+        else:
+            await msg.answer("Уже активна")
+
+    elif action == "remove":
+        if pair in ACTIVE_PAIRS:
+            ACTIVE_PAIRS.remove(pair)
+            ACTIVE_GRIDS.pop(pair, None)
+            save_state()
+            await msg.answer(f"🛑 {pair} удалена")
+        else:
+            await msg.answer("Пара не активна")
+
 @dp.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
 
     lines = ["📊 GRID BOT STATUS", ""]
+    lines.append(f"Active grids: {len(ACTIVE_GRIDS)}/{MAX_GRIDS}")
+    lines.append("")
 
     for p in ACTIVE_PAIRS:
         if p in ACTIVE_GRIDS:
-            g = ACTIVE_GRIDS[p]
-            lines.append(
-                f"{p}: ACTIVE | {g['mode']} | range {g['low']:.4f} → {g['high']:.4f}"
-            )
+            lines.append(f"{p}: ACTIVE | {ACTIVE_GRIDS[p]['mode']}")
         else:
-            reason = LAST_REJECT_REASON.get(p, "waiting")
-            lines.append(f"{p}: NO GRID | {reason}")
+            lines.append(f"{p}: NO GRID | {LAST_REJECT_REASON.get(p,'waiting')}")
 
     await msg.answer("\n".join(lines))
 
-@dp.message(Command("pairs"))
-async def cmd_pairs(msg: types.Message):
-    if msg.from_user.id == ADMIN_ID:
-        await msg.answer("Active pairs:\n" + "\n".join(ACTIVE_PAIRS))
-
 # ================== MAIN ==================
 async def main():
+    load_state()
     asyncio.create_task(grid_engine())
     await dp.start_polling(bot)
 
