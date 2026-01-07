@@ -51,8 +51,13 @@ ACTIVE_PAIRS = ["BTCUSDT", "ETHUSDT"]
 ACTIVE_GRIDS = {}
 
 PAIR_STATS = {}
+
 TOTAL_PNL = 0.0
 DEALS = 0
+WIN_TRADES = 0
+LOSS_TRADES = 0
+GROSS_PROFIT = 0.0
+GROSS_LOSS = 0.0
 
 MAX_EQUITY = DEPOSIT
 MAX_DRAWDOWN = 0.0
@@ -66,13 +71,18 @@ def save_state():
             "PAIR_STATS": PAIR_STATS,
             "TOTAL_PNL": TOTAL_PNL,
             "DEALS": DEALS,
+            "WIN_TRADES": WIN_TRADES,
+            "LOSS_TRADES": LOSS_TRADES,
+            "GROSS_PROFIT": GROSS_PROFIT,
+            "GROSS_LOSS": GROSS_LOSS,
             "MAX_EQUITY": MAX_EQUITY,
             "MAX_DRAWDOWN": MAX_DRAWDOWN
         }, f)
 
 def load_state():
     global ACTIVE_PAIRS, ACTIVE_GRIDS, PAIR_STATS
-    global TOTAL_PNL, DEALS, MAX_EQUITY, MAX_DRAWDOWN
+    global TOTAL_PNL, DEALS, WIN_TRADES, LOSS_TRADES
+    global GROSS_PROFIT, GROSS_LOSS, MAX_EQUITY, MAX_DRAWDOWN
 
     if not os.path.exists(STATE_FILE):
         return
@@ -85,6 +95,10 @@ def load_state():
     PAIR_STATS = d.get("PAIR_STATS", {})
     TOTAL_PNL = d.get("TOTAL_PNL", 0.0)
     DEALS = d.get("DEALS", 0)
+    WIN_TRADES = d.get("WIN_TRADES", 0)
+    LOSS_TRADES = d.get("LOSS_TRADES", 0)
+    GROSS_PROFIT = d.get("GROSS_PROFIT", 0.0)
+    GROSS_LOSS = d.get("GROSS_LOSS", 0.0)
     MAX_EQUITY = d.get("MAX_EQUITY", DEPOSIT)
     MAX_DRAWDOWN = d.get("MAX_DRAWDOWN", 0.0)
 
@@ -92,10 +106,11 @@ def load_state():
 def log_trade(pair, side, entry, exit, qty, pnl):
     equity = DEPOSIT + TOTAL_PNL
     new = not os.path.exists(TRADES_FILE)
+
     with open(TRADES_FILE, "a", newline="") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["time_utc","pair","side","entry","exit","qty","pnl","equity"])
+            w.writerow(["time","pair","side","entry","exit","qty","pnl","equity"])
         w.writerow([
             datetime.utcnow().isoformat(),
             pair, side,
@@ -177,13 +192,13 @@ def build_grid(price, atr_val, side):
     levels = grid_levels(price, atr_val)
     rng = atr_val * atr_mult(price, atr_val)
 
-    if side == "LONG":
-        low, high = price - rng, price + rng
-    else:
-        high, low = price + rng, price - rng
+    low, high = (
+        (price - rng, price + rng)
+        if side == "LONG"
+        else (price + rng, price - rng)
+    )
 
-    step = (high - low) / levels
-
+    step = abs(high - low) / levels
     margin = DEPOSIT * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
     qty = (notional / price) / levels
@@ -191,15 +206,10 @@ def build_grid(price, atr_val, side):
     orders = []
 
     for i in range(levels):
-        if side == "LONG":
-            entry = low + step * i
-            exit = entry + step
-            exp = (exit - entry) * qty
-        else:
-            entry = high - step * i
-            exit = entry - step
-            exp = (entry - exit) * qty
+        entry = low + step * i if side == "LONG" else low - step * i
+        exit = entry + step if side == "LONG" else entry - step
 
+        exp = abs(exit - entry) * qty
         fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
 
         if entry * qty < MIN_ORDER_NOTIONAL:
@@ -207,41 +217,31 @@ def build_grid(price, atr_val, side):
         if exp - fees < MIN_EXPECTED_PNL:
             continue
 
-        orders.append({
-            "entry": entry,
-            "exit": exit,
-            "qty": qty,
-            "open": False
-        })
+        orders.append({"entry":entry,"exit":exit,"qty":qty,"open":False})
 
-    if len(orders) < 3:
-        return None
-
-    return {
+    return None if len(orders) < 3 else {
         "side": side,
-        "low": low,
-        "high": high,
+        "low": min(low, high),
+        "high": max(low, high),
         "orders": orders
     }
 
 def calc_pnl(entry, exit, qty, side):
-    if side == "LONG":
-        gross = (exit - entry) * qty
-    else:
-        gross = (entry - exit) * qty
+    gross = (exit - entry) * qty if side == "LONG" else (entry - exit) * qty
     fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
     return gross - fees
 
 # ================== ENGINE ==================
 async def grid_engine():
-    global TOTAL_PNL, DEALS, MAX_EQUITY, MAX_DRAWDOWN
+    global TOTAL_PNL, DEALS, WIN_TRADES, LOSS_TRADES
+    global GROSS_PROFIT, GROSS_LOSS, MAX_EQUITY, MAX_DRAWDOWN
 
     while True:
         for pair, g in list(ACTIVE_GRIDS.items()):
             kl = await get_klines(pair, limit=2)
             price = float(kl[-1][4])
 
-            if pair not in ACTIVE_PAIRS or price < g["low"] or price > g["high"]:
+            if pair not in ACTIVE_PAIRS or not (g["low"] <= price <= g["high"]):
                 del ACTIVE_GRIDS[pair]
                 continue
 
@@ -258,10 +258,19 @@ async def grid_engine():
                         TOTAL_PNL += pnl
                         DEALS += 1
 
+                        if pnl > 0:
+                            WIN_TRADES += 1
+                            GROSS_PROFIT += pnl
+                        else:
+                            LOSS_TRADES += 1
+                            GROSS_LOSS += pnl
+
                         equity = DEPOSIT + TOTAL_PNL
                         MAX_EQUITY = max(MAX_EQUITY, equity)
-                        dd = (equity - MAX_EQUITY) / MAX_EQUITY * 100
-                        MAX_DRAWDOWN = min(MAX_DRAWDOWN, dd)
+                        MAX_DRAWDOWN = min(
+                            MAX_DRAWDOWN,
+                            (equity - MAX_EQUITY) / MAX_EQUITY * 100
+                        )
 
                         PAIR_STATS.setdefault(pair, {"pnl":0,"deals":0})
                         PAIR_STATS[pair]["pnl"] += pnl
@@ -297,13 +306,17 @@ async def heartbeat():
     while True:
         equity = DEPOSIT + TOTAL_PNL
         roi = (equity - DEPOSIT) / DEPOSIT * 100
+        pf = abs(GROSS_PROFIT / GROSS_LOSS) if GROSS_LOSS != 0 else float("inf")
+        avg = TOTAL_PNL / DEALS if DEALS else 0
+        wr = (WIN_TRADES / DEALS * 100) if DEALS else 0
+
         await bot.send_message(
             ADMIN_ID,
-            f"✅ GRID BOT ONLINE\n"
-            f"Active pairs: {', '.join(ACTIVE_PAIRS)}\n"
+            f"📊 GRID BOT\n"
             f"Equity: {equity:.2f}$ | ROI: {roi:.2f}%\n"
-            f"Max DD: {MAX_DRAWDOWN:.2f}%\n"
-            f"Deals: {DEALS}"
+            f"Avg PnL: {avg:.3f}$ | WinRate: {wr:.1f}% | PF: {pf:.2f}\n"
+            f"Deals: {DEALS} | Max DD: {MAX_DRAWDOWN:.2f}%\n"
+            f"Active grids: {len(ACTIVE_GRIDS)}/{MAX_GRIDS}"
         )
         save_state()
         await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -314,48 +327,6 @@ async def start(msg: types.Message):
     if msg.from_user.id == ADMIN_ID:
         await msg.answer("🤖 GRID BOT RUNNING")
 
-@dp.message(Command("pairs"))
-async def show_pairs(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    await msg.answer("📊 Active pairs:\n" + "\n".join(f"• {p}" for p in ACTIVE_PAIRS))
-
-@dp.message(Command("pair"))
-async def manage_pair(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-
-    parts = msg.text.split()
-    if len(parts) != 3:
-        await msg.answer("Используй: /pair add|remove SYMBOL")
-        return
-
-    action, pair = parts[1], parts[2].upper()
-
-    if pair not in ALL_PAIRS:
-        await msg.answer("❌ Пара не разрешена")
-        return
-
-    if action == "add":
-        if pair not in ACTIVE_PAIRS:
-            ACTIVE_PAIRS.append(pair)
-            save_state()
-            await msg.answer(f"✅ {pair} добавлена")
-        else:
-            await msg.answer("Уже активна")
-
-    elif action == "remove":
-        if pair in ACTIVE_PAIRS:
-            ACTIVE_PAIRS.remove(pair)
-            ACTIVE_GRIDS.pop(pair, None)
-            save_state()
-            await msg.answer(f"🛑 {pair} удалена")
-        else:
-            await msg.answer("Пара не активна")
-
-    else:
-        await msg.answer("Команда: /pair add|remove SYMBOL")
-
 @dp.message(Command("stats"))
 async def stats(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
@@ -363,6 +334,9 @@ async def stats(msg: types.Message):
 
     equity = DEPOSIT + TOTAL_PNL
     roi = (equity - DEPOSIT) / DEPOSIT * 100
+    pf = abs(GROSS_PROFIT / GROSS_LOSS) if GROSS_LOSS != 0 else float("inf")
+    avg = TOTAL_PNL / DEALS if DEALS else 0
+    wr = (WIN_TRADES / DEALS * 100) if DEALS else 0
 
     lines = [
         "📊 GRID BOT STATS",
@@ -370,16 +344,17 @@ async def stats(msg: types.Message):
         f"Equity: {equity:.2f}$",
         f"ROI: {roi:.2f}%",
         f"Max DD: {MAX_DRAWDOWN:.2f}%",
+        "",
         f"Deals: {DEALS}",
+        f"Avg PnL / trade: {avg:.3f}$",
+        f"Win rate: {wr:.1f}%",
+        f"Profit factor: {pf:.2f}",
         "",
         "Pairs:"
     ]
 
-    if PAIR_STATS:
-        for p, s in PAIR_STATS.items():
-            lines.append(f"• {p}: {s['pnl']:.2f}$ ({s['deals']} deals)")
-    else:
-        lines.append("• нет данных")
+    for p, s in PAIR_STATS.items():
+        lines.append(f"• {p}: {s['pnl']:.2f}$ ({s['deals']} deals)")
 
     lines.append("")
     lines.append("Active pairs:")
