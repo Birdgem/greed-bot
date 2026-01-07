@@ -175,6 +175,41 @@ async def cmd_pair(msg: types.Message):
             await msg.answer(f"🛑 {pair} removed")
         else:
             await msg.answer("Not active")
+@dp.message(Command("stats"))
+async def cmd_stats(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    uptime = int((time.time() - START_TS) / 60)
+
+    equity = DEPOSIT + TOTAL_PNL
+    roi = (equity - DEPOSIT) / DEPOSIT * 100 if DEPOSIT else 0
+
+    avg_pnl = TOTAL_PNL / DEALS if DEALS else 0
+    winrate = (WIN_TRADES / DEALS * 100) if DEALS else 0
+    pf = abs(GROSS_PROFIT / GROSS_LOSS) if GROSS_LOSS != 0 else float("inf")
+
+    text = [
+        "📊 GRID BOT — STATS",
+        "",
+        f"Uptime: {uptime} min",
+        f"Timeframe: {TIMEFRAME}",
+        f"Scan interval: {SCAN_INTERVAL}s",
+        "",
+        f"Equity: {equity:.2f}$",
+        f"ROI: {roi:.2f}%",
+        f"Deals: {DEALS}",
+        f"WinRate: {winrate:.1f}%",
+        f"Avg PnL: {avg_pnl:.4f}$",
+        f"Profit factor: {pf:.2f}",
+        "",
+        f"Active grids: {len(ACTIVE_GRIDS)}/{MAX_GRIDS}",
+        "",
+        "Active pairs:",
+        ", ".join(ACTIVE_PAIRS)
+    ]
+
+    await msg.answer("\n".join(text))
 
 # ================== ENGINE ==================
 async def grid_engine():
