@@ -6,7 +6,6 @@ import asyncio
 import aiohttp
 import time
 from statistics import mean
-from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
@@ -42,17 +41,20 @@ SCAN_INTERVAL = 20
 HEARTBEAT_INTERVAL = 1800
 
 MIN_ORDER_NOTIONAL = 5.0
-MIN_EXPECTED_PNL = 0.05
 
 # ================== STATE ==================
 START_TS = time.time()
 
+# 🔒 DEFAULT PAIRS
 ACTIVE_PAIRS = ["SOLUSDT", "BNBUSDT"]
 ACTIVE_GRIDS = {}
 LAST_REJECT_REASON = {}
 
 TOTAL_PNL = 0.0
 DEALS = 0
+
+# ➕ PAIR STATS
+PAIR_STATS = {}
 
 # ================== STATE IO ==================
 def save_state():
@@ -61,19 +63,22 @@ def save_state():
             "ACTIVE_PAIRS": ACTIVE_PAIRS,
             "ACTIVE_GRIDS": ACTIVE_GRIDS,
             "TOTAL_PNL": TOTAL_PNL,
-            "DEALS": DEALS
+            "DEALS": DEALS,
+            "PAIR_STATS": PAIR_STATS
         }, f)
 
 def load_state():
-    global ACTIVE_PAIRS, ACTIVE_GRIDS, TOTAL_PNL, DEALS
+    global ACTIVE_PAIRS, ACTIVE_GRIDS, TOTAL_PNL, DEALS, PAIR_STATS
     if not os.path.exists(STATE_FILE):
         return
     with open(STATE_FILE) as f:
         d = json.load(f)
+
     ACTIVE_PAIRS = d.get("ACTIVE_PAIRS", ACTIVE_PAIRS)
     ACTIVE_GRIDS = d.get("ACTIVE_GRIDS", {})
     TOTAL_PNL = d.get("TOTAL_PNL", 0.0)
     DEALS = d.get("DEALS", 0)
+    PAIR_STATS = d.get("PAIR_STATS", {})
 
 # ================== INDICATORS ==================
 def ema(data, p):
@@ -123,7 +128,7 @@ async def analyze_pair(pair):
         LAST_REJECT_REASON[pair] = "ATR unavailable"
         return None
 
-    # === ВАЖНО: FLAT ТЕПЕРЬ РАЗРЕШЕН ===
+    # ✅ FLAT РАЗРЕШЕН
     if price > e7 > e25:
         side = "LONG"
     elif price < e7 < e25:
@@ -149,15 +154,8 @@ def build_grid(price, atr_val, side):
     orders = []
 
     for i in range(levels):
-        if side == "LONG":
-            entry = low + step * i
-            exit = entry + step
-        elif side == "SHORT":
-            entry = high - step * i
-            exit = entry - step
-        else:  # FLAT
-            entry = low + step * i
-            exit = entry + step
+        entry = low + step * i
+        exit = entry + step
 
         if entry * qty < MIN_ORDER_NOTIONAL:
             continue
@@ -181,7 +179,7 @@ def build_grid(price, atr_val, side):
         "atr": atr_val
     }
 
-def calc_pnl(entry, exit, qty, side):
+def calc_pnl(entry, exit, qty):
     gross = (exit - entry) * qty
     fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
     return gross - fees
@@ -207,9 +205,24 @@ async def grid_engine():
                 if not o["open"] and price <= o["entry"]:
                     o["open"] = True
                 elif o["open"] and price >= o["exit"]:
-                    pnl = calc_pnl(o["entry"], o["exit"], o["qty"], g["side"])
+                    pnl = calc_pnl(o["entry"], o["exit"], o["qty"])
                     TOTAL_PNL += pnl
                     DEALS += 1
+
+                    PAIR_STATS.setdefault(pair, {
+                        "pnl": 0.0,
+                        "deals": 0,
+                        "wins": 0,
+                        "losses": 0
+                    })
+
+                    PAIR_STATS[pair]["pnl"] += pnl
+                    PAIR_STATS[pair]["deals"] += 1
+                    if pnl > 0:
+                        PAIR_STATS[pair]["wins"] += 1
+                    else:
+                        PAIR_STATS[pair]["losses"] += 1
+
                     o["open"] = False
                     save_state()
 
@@ -242,31 +255,6 @@ async def cmd_pairs(msg: types.Message):
         return
     await msg.answer("Active pairs:\n" + "\n".join(ACTIVE_PAIRS))
 
-@dp.message(Command("pair"))
-async def cmd_pair(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    parts = msg.text.split()
-    if len(parts) != 3:
-        await msg.answer("Usage: /pair add|remove SYMBOL")
-        return
-
-    action, pair = parts[1], parts[2].upper()
-    if pair not in ALL_PAIRS:
-        await msg.answer("Pair not allowed")
-        return
-
-    if action == "add" and pair not in ACTIVE_PAIRS:
-        ACTIVE_PAIRS.append(pair)
-        save_state()
-        await msg.answer(f"✅ {pair} added")
-
-    elif action == "remove" and pair in ACTIVE_PAIRS:
-        ACTIVE_PAIRS.remove(pair)
-        ACTIVE_GRIDS.pop(pair, None)
-        save_state()
-        await msg.answer(f"🛑 {pair} removed")
-
 @dp.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
@@ -283,13 +271,25 @@ async def cmd_stats(msg: types.Message):
         f"Deals: {DEALS}",
         f"Active grids: {len(ACTIVE_GRIDS)}/{MAX_GRIDS}",
         "",
-        "Grids:"
+        "📈 Pair stats:"
     ]
 
-    for p, g in ACTIVE_GRIDS.items():
+    for pair in ACTIVE_PAIRS:
+        ps = PAIR_STATS.get(pair)
+        if not ps:
+            lines.append(f"• {pair}: no trades")
+            continue
+
+        deals = ps["deals"]
+        pnl = ps["pnl"]
+        avg = pnl / deals if deals else 0
+        wr = (ps["wins"] / deals * 100) if deals else 0
+        status = "GRID" if pair in ACTIVE_GRIDS else "WAITING"
+
         lines.append(
-            f"• {p} | {g['side']} | ATR {g['atr']:.6f}\n"
-            f"  {g['low']:.6f} → {g['high']:.6f}"
+            f"• {pair} | {status}\n"
+            f"  Deals: {deals} | WinRate: {wr:.1f}%\n"
+            f"  PnL: {pnl:.2f}$ | Avg: {avg:.3f}$"
         )
 
     await msg.answer("\n".join(lines))
