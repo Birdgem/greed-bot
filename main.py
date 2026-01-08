@@ -24,7 +24,7 @@ ALL_PAIRS = [
     "HUSDT", "CYSUSDT"
 ]
 
-TIMEFRAME = "5m"
+TIMEFRAME = "15m"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
 # ---- GRID PARAMS ----
