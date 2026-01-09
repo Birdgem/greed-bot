@@ -17,15 +17,13 @@ dp = Dispatcher()
 STATE_FILE = "state.json"
 
 # ================== SETTINGS ==================
-AUTO_MODE = True          # <<< АВТОПОДБОР ВКЛЮЧЕН
-MAX_AUTO_PAIRS = 4        # сколько пар может выбрать бот
+AUTO_MODE = True
+MAX_AUTO_PAIRS = 4
+AUTO_SCAN_INTERVAL = 300  # 5 минут
 
 ALL_PAIRS = [
-    "SOLUSDT", "BNBUSDT",
-    "DOGEUSDT", "TRXUSDT",
-    "ADAUSDT", "XRPUSDT",
-    "TONUSDT", "ARBUSDT",
-    "OPUSDT"
+    "SOLUSDT", "BNBUSDT", "DOGEUSDT", "TRXUSDT",
+    "ADAUSDT", "XRPUSDT", "TONUSDT", "ARBUSDT", "OPUSDT"
 ]
 
 TIMEFRAME = "15m"
@@ -47,9 +45,10 @@ MIN_ORDER_NOTIONAL = 5.0
 
 # ================== STATE ==================
 START_TS = time.time()
+LAST_AUTO_SCAN = 0
 
-ACTIVE_PAIRS = ["SOLUSDT", "BNBUSDT"]   # ручные (приоритет)
-AUTO_SELECTED_PAIRS = []                # выбранные ботом
+ACTIVE_PAIRS = ["SOLUSDT", "BNBUSDT"]   # ручные
+AUTO_SELECTED_PAIRS = []               # авто
 ACTIVE_GRIDS = {}
 LAST_REJECT_REASON = {}
 
@@ -112,7 +111,6 @@ async def get_klines(symbol, limit=120):
 # ================== AUTO PAIR SELECTION ==================
 async def auto_select_pairs():
     global AUTO_SELECTED_PAIRS
-
     scored = []
 
     for pair in ALL_PAIRS:
@@ -133,8 +131,7 @@ async def auto_select_pairs():
 
         atr_pct = a / price * 100
 
-        # фильтры под грид
-        if price > 15:
+        if price > 20:
             LAST_REJECT_REASON[pair] = "price too high"
             continue
         if atr_pct < 0.4 or atr_pct > 3.0:
@@ -143,8 +140,7 @@ async def auto_select_pairs():
 
         scored.append((pair, atr_pct))
 
-    scored.sort(key=lambda x: abs(x[1] - 1.2))  # золотая середина
-
+    scored.sort(key=lambda x: abs(x[1] - 1.2))
     AUTO_SELECTED_PAIRS = [p for p, _ in scored[:MAX_AUTO_PAIRS]]
 
 # ================== ANALYSIS ==================
@@ -201,11 +197,12 @@ def calc_pnl(entry, exit, qty):
 
 # ================== ENGINE ==================
 async def grid_engine():
-    global TOTAL_PNL, DEALS
+    global TOTAL_PNL, DEALS, LAST_AUTO_SCAN
 
     while True:
-        if AUTO_MODE:
+        if AUTO_MODE and time.time() - LAST_AUTO_SCAN > AUTO_SCAN_INTERVAL:
             await auto_select_pairs()
+            LAST_AUTO_SCAN = time.time()
 
         all_pairs = list(set(ACTIVE_PAIRS + AUTO_SELECTED_PAIRS))
 
@@ -226,9 +223,11 @@ async def grid_engine():
                     pnl = calc_pnl(o["entry"], o["exit"], o["qty"])
                     TOTAL_PNL += pnl
                     DEALS += 1
+
                     PAIR_STATS.setdefault(pair, {"pnl": 0.0, "deals": 0})
                     PAIR_STATS[pair]["pnl"] += pnl
                     PAIR_STATS[pair]["deals"] += 1
+
                     o["open"] = False
                     save_state()
 
@@ -246,6 +245,22 @@ async def grid_engine():
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ================== COMMANDS ==================
+@dp.message(Command("pairs"))
+async def cmd_pairs(msg: types.Message):
+    all_pairs = list(set(ACTIVE_PAIRS + AUTO_SELECTED_PAIRS))
+    await msg.answer("📌 Active pairs:\n" + ", ".join(all_pairs))
+
+@dp.message(Command("why"))
+async def cmd_why(msg: types.Message):
+    lines = ["🤔 WHY NO GRID"]
+    all_pairs = list(set(ACTIVE_PAIRS + AUTO_SELECTED_PAIRS))
+    for p in all_pairs:
+        if p in ACTIVE_GRIDS:
+            lines.append(f"{p}: GRID ACTIVE")
+        else:
+            lines.append(f"{p}: {LAST_REJECT_REASON.get(p, 'waiting')}")
+    await msg.answer("\n".join(lines))
+
 @dp.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
     equity = DEPOSIT + TOTAL_PNL
@@ -263,7 +278,10 @@ async def cmd_stats(msg: types.Message):
 
     for p, s in PAIR_STATS.items():
         avg = s["pnl"] / s["deals"]
-        lines.append(f"• {p}: Deals {s['deals']} | PnL {s['pnl']:.2f}$ | Avg {avg:.3f}$")
+        lines.append(
+            f"• {p}: Deals {s['deals']} | "
+            f"PnL {s['pnl']:.2f}$ | Avg {avg:.3f}$"
+        )
 
     await msg.answer("\n".join(lines))
 
