@@ -19,11 +19,13 @@ STATE_FILE = "state.json"
 # ================== SETTINGS ==================
 AUTO_MODE = True
 MAX_AUTO_PAIRS = 4
-AUTO_SCAN_INTERVAL = 300  # 5 минут
 
 ALL_PAIRS = [
-    "SOLUSDT", "BNBUSDT", "DOGEUSDT", "TRXUSDT",
-    "ADAUSDT", "XRPUSDT", "TONUSDT", "ARBUSDT", "OPUSDT"
+    "SOLUSDT", "BNBUSDT",
+    "DOGEUSDT", "TRXUSDT",
+    "ADAUSDT", "XRPUSDT",
+    "TONUSDT", "ARBUSDT",
+    "OPUSDT"
 ]
 
 TIMEFRAME = "15m"
@@ -45,10 +47,10 @@ MIN_ORDER_NOTIONAL = 5.0
 
 # ================== STATE ==================
 START_TS = time.time()
-LAST_AUTO_SCAN = 0
 
-ACTIVE_PAIRS = ["SOLUSDT", "BNBUSDT"]   # ручные
-AUTO_SELECTED_PAIRS = []               # авто
+ACTIVE_PAIRS = ["SOLUSDT", "BNBUSDT"]
+AUTO_SELECTED_PAIRS = []
+
 ACTIVE_GRIDS = {}
 LAST_REJECT_REASON = {}
 
@@ -131,10 +133,10 @@ async def auto_select_pairs():
 
         atr_pct = a / price * 100
 
-        if price > 20:
+        if price > 15:
             LAST_REJECT_REASON[pair] = "price too high"
             continue
-        if atr_pct < 0.4 or atr_pct > 3.0:
+        if not (0.4 <= atr_pct <= 3.0):
             LAST_REJECT_REASON[pair] = f"ATR {atr_pct:.2f}% bad"
             continue
 
@@ -197,12 +199,11 @@ def calc_pnl(entry, exit, qty):
 
 # ================== ENGINE ==================
 async def grid_engine():
-    global TOTAL_PNL, DEALS, LAST_AUTO_SCAN
+    global TOTAL_PNL, DEALS
 
     while True:
-        if AUTO_MODE and time.time() - LAST_AUTO_SCAN > AUTO_SCAN_INTERVAL:
+        if AUTO_MODE:
             await auto_select_pairs()
-            LAST_AUTO_SCAN = time.time()
 
         all_pairs = list(set(ACTIVE_PAIRS + AUTO_SELECTED_PAIRS))
 
@@ -210,6 +211,7 @@ async def grid_engine():
             kl = await get_klines(pair, 2)
             if not kl:
                 continue
+
             price = float(kl[-1][4])
 
             if pair not in all_pairs or not (g["low"] <= price <= g["high"]):
@@ -224,9 +226,20 @@ async def grid_engine():
                     TOTAL_PNL += pnl
                     DEALS += 1
 
-                    PAIR_STATS.setdefault(pair, {"pnl": 0.0, "deals": 0})
-                    PAIR_STATS[pair]["pnl"] += pnl
-                    PAIR_STATS[pair]["deals"] += 1
+                    PAIR_STATS.setdefault(pair, {
+                        "pnl": 0.0,
+                        "deals": 0,
+                        "wins": 0,
+                        "losses": 0
+                    })
+
+                    ps = PAIR_STATS[pair]
+                    ps["pnl"] += pnl
+                    ps["deals"] += 1
+                    if pnl > 0:
+                        ps["wins"] += 1
+                    else:
+                        ps["losses"] += 1
 
                     o["open"] = False
                     save_state()
@@ -245,42 +258,48 @@ async def grid_engine():
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ================== COMMANDS ==================
-@dp.message(Command("pairs"))
-async def cmd_pairs(msg: types.Message):
-    all_pairs = list(set(ACTIVE_PAIRS + AUTO_SELECTED_PAIRS))
-    await msg.answer("📌 Active pairs:\n" + ", ".join(all_pairs))
-
-@dp.message(Command("why"))
-async def cmd_why(msg: types.Message):
-    lines = ["🤔 WHY NO GRID"]
-    all_pairs = list(set(ACTIVE_PAIRS + AUTO_SELECTED_PAIRS))
-    for p in all_pairs:
-        if p in ACTIVE_GRIDS:
-            lines.append(f"{p}: GRID ACTIVE")
-        else:
-            lines.append(f"{p}: {LAST_REJECT_REASON.get(p, 'waiting')}")
-    await msg.answer("\n".join(lines))
-
 @dp.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    uptime = int((time.time() - START_TS) / 60)
     equity = DEPOSIT + TOTAL_PNL
     roi = (equity - DEPOSIT) / DEPOSIT * 100
-    uptime = int((time.time() - START_TS) / 60)
+
+    used_margin = len(ACTIVE_GRIDS) * DEPOSIT * MAX_MARGIN_PER_GRID
+    free_margin = DEPOSIT - used_margin
+    margin_pct = used_margin / DEPOSIT * 100
 
     lines = [
-        "📊 GRID BOT STATUS",
+        "📊 GRID BOT — FULL STATS",
         f"Uptime: {uptime} min",
         f"Equity: {equity:.2f}$ | ROI: {roi:.2f}%",
         f"Deals: {DEALS}",
         "",
-        "Pair stats:"
+        f"Deposit: {DEPOSIT:.2f}$",
+        f"Used margin: {used_margin:.2f}$ ({margin_pct:.0f}%)",
+        f"Free margin: {free_margin:.2f}$",
+        f"Margin / grid: {DEPOSIT * MAX_MARGIN_PER_GRID:.2f}$",
+        "",
+        "📈 Pair stats:"
     ]
 
-    for p, s in PAIR_STATS.items():
-        avg = s["pnl"] / s["deals"]
+    for pair in ACTIVE_PAIRS + AUTO_SELECTED_PAIRS:
+        ps = PAIR_STATS.get(pair)
+        status = "GRID" if pair in ACTIVE_GRIDS else "WAIT"
+
+        if not ps:
+            lines.append(f"• {pair} | {status} | no trades")
+            continue
+
+        avg = ps["pnl"] / ps["deals"] if ps["deals"] else 0
+        wr = (ps["wins"] / ps["deals"] * 100) if ps["deals"] else 0
+
         lines.append(
-            f"• {p}: Deals {s['deals']} | "
-            f"PnL {s['pnl']:.2f}$ | Avg {avg:.3f}$"
+            f"• {pair} | {status}\n"
+            f"  Deals: {ps['deals']} | WR: {wr:.1f}%\n"
+            f"  PnL: {ps['pnl']:.2f}$ | Avg: {avg:.3f}$"
         )
 
     await msg.answer("\n".join(lines))
