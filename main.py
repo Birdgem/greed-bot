@@ -48,7 +48,7 @@ MIN_ORDER_NOTIONAL = 5.0
 # ================== STATE ==================
 START_TS = time.time()
 
-ACTIVE_PAIRS = ["SOLUSDT", "BNBUSDT"]
+ACTIVE_PAIRS = ["SOLUSDT", "DOGEUSDT"]
 AUTO_SELECTED_PAIRS = []
 
 ACTIVE_GRIDS = {}
